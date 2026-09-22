@@ -113,14 +113,23 @@ def probe_file(path: Path) -> MediaInfo:
     cmd = [
         ffprobe,
         "-v",
-        "quiet",
+        "error",
         "-print_format",
         "json",
         "-show_format",
         "-show_streams",
         str(path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ProbeError(f"ffprobe agotó el tiempo en {path.name}") from exc
     if result.returncode != 0:
         raise ProbeError(result.stderr.strip() or f"ffprobe falló en {path.name}")
 

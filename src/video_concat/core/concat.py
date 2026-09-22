@@ -17,8 +17,10 @@ from pathlib import Path
 from video_concat.core.compatibility import CompatibilityReport, ConcatMode
 from video_concat.core.gpu import GpuCapabilities, detect_gpu
 from video_concat.core.probe import MediaInfo
+from video_concat.logutil import get_logger
 
 ProgressCallback = Callable[[float, str], None]
+log = get_logger("concat")
 
 
 class ConcatError(RuntimeError):
@@ -293,6 +295,7 @@ class ConcatJob:
             cmd = [*cmd[:-1], "-progress", str(progress_path), "-nostats", out]
 
             self._emit(0.0, f"Iniciando ({pipeline}: {encoder})…")
+            log.info("ffmpeg cmd: %s", " ".join(cmd))
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,

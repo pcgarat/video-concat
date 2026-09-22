@@ -48,7 +48,10 @@ install-dev: venv
 	$(PIP) install -e ".[dev]"
 
 run-local: install
-	$(VENV)/bin/video-concat
+	@# Cursor/conda contaminan LD_LIBRARY_PATH/QT_PLUGIN_PATH con Qt ajeno.
+	env -u QT_PLUGIN_PATH -u QT_QPA_PLATFORM_PLUGIN_PATH \
+		LD_LIBRARY_PATH= \
+		$(VENV)/bin/video-concat
 
 build:
 	$(COMPOSE) build

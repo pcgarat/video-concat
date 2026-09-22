@@ -26,11 +26,13 @@ from PySide6.QtWidgets import (
 from video_concat.core.compatibility import CompatibilityReport, analyze_compatibility
 from video_concat.core.concat import ConcatError, ConcatJob, ConcatResult, Pipeline, select_pipeline
 from video_concat.core.gpu import GpuCapabilities, detect_gpu
-from video_concat.core.probe import MediaInfo, ProbeError, probe_many
+from video_concat.core.probe import MediaInfo, ProbeError, probe_file
+from video_concat.logutil import get_logger
 from video_concat.ui.styles import APP_STYLE, COLORS
 from video_concat.ui.widgets import TimelineStrip
 
 VIDEO_FILTER = "Vídeos MP4 (*.mp4 *.MP4)"
+log = get_logger("ui")
 
 
 def _format_duration(seconds: float) -> str:
@@ -53,6 +55,7 @@ def _format_size(n: int) -> str:
 
 
 class ProbeWorker(QObject):
+    progress = Signal(float, str)
     finished = Signal(list)
     failed = Signal(str)
 
@@ -62,11 +65,28 @@ class ProbeWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        log.info("ProbeWorker arranca (%d ficheros)", len(self.paths))
+        results: list[MediaInfo] = []
+        total = len(self.paths) or 1
         try:
-            self.finished.emit(probe_many(self.paths))
+            for i, path in enumerate(self.paths):
+                self.progress.emit(i / total, f"Analizando {path.name}…")
+                log.info("ffprobe → %s", path)
+                results.append(probe_file(path))
+                log.info(
+                    "ok %s (%s, %.2fs)",
+                    path.name,
+                    results[-1].resolution,
+                    results[-1].duration,
+                )
+            self.progress.emit(1.0, "Análisis completado")
+            log.info("ProbeWorker terminó OK")
+            self.finished.emit(results)
         except ProbeError as exc:
+            log.error("ProbeWorker ProbeError: %s", exc)
             self.failed.emit(str(exc))
         except Exception as exc:  # noqa: BLE001
+            log.exception("ProbeWorker error inesperado")
             self.failed.emit(f"Error al analizar: {exc}")
 
 
@@ -90,14 +110,24 @@ class ConcatWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        log.info("ConcatWorker arranca → %s", self.job.output)
         try:
-            self.finished.emit(self.job.run())
+            result = self.job.run()
+            log.info(
+                "ConcatWorker OK pipeline=%s encoder=%s",
+                result.pipeline,
+                result.used_encoder,
+            )
+            self.finished.emit(result)
         except ConcatError as exc:
+            log.error("ConcatWorker ConcatError: %s", exc)
             self.failed.emit(str(exc))
         except Exception as exc:  # noqa: BLE001
+            log.exception("ConcatWorker error inesperado")
             self.failed.emit(f"Error inesperado: {exc}")
 
     def cancel(self) -> None:
+        log.info("ConcatWorker cancel solicitado")
         self.job.cancel()
 
 
@@ -114,9 +144,12 @@ class MainWindow(QMainWindow):
         self._report: CompatibilityReport | None = None
         self._gpu = detect_gpu()
         self._probe_thread: QThread | None = None
+        self._probe_worker: ProbeWorker | None = None
         self._concat_thread: QThread | None = None
         self._concat_worker: ConcatWorker | None = None
         self._busy = False
+
+        log.info("GPU detectada: %s (cuda_full=%s)", self._gpu, self._gpu.cuda_full)
 
         self._build_ui()
         self._update_mode_panel()
@@ -303,29 +336,50 @@ class MainWindow(QMainWindow):
 
     def _ingest_paths(self, paths: list[Path]) -> None:
         if self._busy:
+            log.warning("Ignoro ingestión: UI ocupada")
             return
         existing = {m.path for m in self._items}
         fresh = [p.resolve() for p in paths if p.resolve() not in existing]
         if not fresh:
+            log.info("Nada nuevo que añadir")
             return
+
+        log.info("Ingestión de %d clip(s): %s", len(fresh), [p.name for p in fresh])
         self._set_busy(True, "Analizando clips…")
-        thread = QThread(self)
-        worker = ProbeWorker(fresh)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_probe_ok)
-        worker.failed.connect(self._on_probe_fail)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._probe_thread = thread
-        thread.start()
+        self.progress.setValue(0)
+
+        # Referencias fuertes: si el worker es local, Python lo GC y aborta el QThread.
+        self._probe_thread = QThread(self)
+        self._probe_worker = ProbeWorker(fresh)
+        self._probe_worker.moveToThread(self._probe_thread)
+
+        self._probe_thread.started.connect(self._probe_worker.run)
+        self._probe_worker.progress.connect(
+            self._on_probe_progress, Qt.ConnectionType.QueuedConnection
+        )
+        self._probe_worker.finished.connect(
+            self._on_probe_ok, Qt.ConnectionType.QueuedConnection
+        )
+        self._probe_worker.failed.connect(
+            self._on_probe_fail, Qt.ConnectionType.QueuedConnection
+        )
+        self._probe_worker.finished.connect(self._probe_thread.quit)
+        self._probe_worker.failed.connect(self._probe_thread.quit)
+        self._probe_thread.finished.connect(self._on_probe_thread_finished)
+        self._probe_thread.start()
+        log.info("Hilo de análisis arrancado")
+
+    @Slot(float, str)
+    def _on_probe_progress(self, value: float, message: str) -> None:
+        self.progress.setValue(int(value * 1000))
+        self.status_label.setText(message)
 
     @Slot(list)
     def _on_probe_ok(self, medias: list) -> None:
+        log.info("Análisis OK: %d clip(s)", len(medias))
         self._items.extend(medias)
         self._refresh_list()
+        self.progress.setValue(1000)
         self._set_busy(False, f"Añadidos {len(medias)} clip(s)")
         if not self.output_edit.text() and self._items:
             default = self._items[0].path.with_name("concat_output.mp4")
@@ -333,8 +387,15 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_probe_fail(self, message: str) -> None:
+        log.error("Análisis falló: %s", message)
         self._set_busy(False, "Error al analizar")
         QMessageBox.warning(self, "Análisis", message)
+
+    @Slot()
+    def _on_probe_thread_finished(self) -> None:
+        log.info("Hilo de análisis finalizado")
+        self._probe_worker = None
+        self._probe_thread = None
 
     def _refresh_list(self) -> None:
         self.list_widget.clear()
@@ -480,24 +541,34 @@ class MainWindow(QMainWindow):
         report = analyze_compatibility(self._items)
         self._report = report
         self._update_mode_panel()
+        pipeline = select_pipeline(report, self._gpu)
+        log.info(
+            "Concatenar %d clips → %s (pipeline=%s)",
+            len(self._items),
+            out,
+            pipeline,
+        )
         self._set_busy(True, "Concatenando…")
         self.btn_cancel.setEnabled(True)
         self.progress.setValue(0)
 
-        thread = QThread(self)
-        worker = ConcatWorker(self._items, out, report, self._gpu)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.progress.connect(self._on_progress)
-        worker.finished.connect(self._on_concat_ok)
-        worker.failed.connect(self._on_concat_fail)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._concat_thread = thread
-        self._concat_worker = worker
-        thread.start()
+        self._concat_thread = QThread(self)
+        self._concat_worker = ConcatWorker(self._items, out, report, self._gpu)
+        self._concat_worker.moveToThread(self._concat_thread)
+        self._concat_thread.started.connect(self._concat_worker.run)
+        self._concat_worker.progress.connect(
+            self._on_progress, Qt.ConnectionType.QueuedConnection
+        )
+        self._concat_worker.finished.connect(
+            self._on_concat_ok, Qt.ConnectionType.QueuedConnection
+        )
+        self._concat_worker.failed.connect(
+            self._on_concat_fail, Qt.ConnectionType.QueuedConnection
+        )
+        self._concat_worker.finished.connect(self._concat_thread.quit)
+        self._concat_worker.failed.connect(self._concat_thread.quit)
+        self._concat_thread.finished.connect(self._on_concat_thread_finished)
+        self._concat_thread.start()
 
     @Slot(float, str)
     def _on_progress(self, value: float, message: str) -> None:
@@ -507,8 +578,8 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_concat_ok(self, result: object) -> None:
         assert isinstance(result, ConcatResult)
+        log.info("Concat OK: %s", result.output)
         self.btn_cancel.setEnabled(False)
-        self._concat_worker = None
         self.progress.setValue(1000)
         self._set_busy(False, f"Listo · {result.used_encoder} → {result.output.name}")
         QMessageBox.information(
@@ -520,12 +591,31 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_concat_fail(self, message: str) -> None:
+        log.error("Concat falló: %s", message)
         self.btn_cancel.setEnabled(False)
-        self._concat_worker = None
         self._set_busy(False, "Error")
         QMessageBox.critical(self, "Concatenación", message)
+
+    @Slot()
+    def _on_concat_thread_finished(self) -> None:
+        log.info("Hilo de concatenación finalizado")
+        self._concat_worker = None
+        self._concat_thread = None
 
     def _cancel_concat(self) -> None:
         if self._concat_worker:
             self._concat_worker.cancel()
             self.status_label.setText("Cancelando…")
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        log.info("Cerrando ventana")
+        if self._concat_worker:
+            self._concat_worker.cancel()
+        for thread in (self._probe_thread, self._concat_thread):
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                if not thread.wait(5000):
+                    log.warning("Hilo no terminó a tiempo; se fuerza terminación")
+                    thread.terminate()
+                    thread.wait(1000)
+        event.accept()

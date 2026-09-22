@@ -5,8 +5,15 @@ from __future__ import annotations
 import os
 import sys
 
+from video_concat.logutil import get_logger, setup_logging
+from video_concat.qt_runtime import reexec_if_needed
+
 
 def main() -> int:
+    # Cursor/conda inyectan LD_LIBRARY_PATH con Qt del sistema → hay que re-exec.
+    reexec_if_needed()
+    setup_logging()
+
     # Preferir Wayland si está disponible; permitir override por entorno.
     if not os.environ.get("QT_QPA_PLATFORM"):
         if os.environ.get("WAYLAND_DISPLAY"):
@@ -18,11 +25,15 @@ def main() -> int:
 
     from video_concat.ui.main_window import MainWindow
 
+    log = get_logger("main")
+    log.info("Arrancando Video Concat")
+
     app = QApplication(sys.argv)
     app.setApplicationName("Video Concat")
     app.setOrganizationName("tools")
     window = MainWindow()
     window.show()
+    log.info("Ventana visible (platform=%s)", app.platformName())
     return app.exec()
 
 

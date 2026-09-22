@@ -1,7 +1,14 @@
 from pathlib import Path
 
 from video_concat.core.compatibility import ConcatMode, analyze_compatibility
-from video_concat.core.concat import _escape_concat_path, _parse_out_time_ms
+from video_concat.core.concat import (
+    Pipeline,
+    _escape_concat_path,
+    _parse_out_time_ms,
+    build_command,
+    select_pipeline,
+)
+from video_concat.core.gpu import GpuCapabilities
 from video_concat.core.probe import MediaInfo, StreamInfo
 
 
@@ -72,5 +79,29 @@ def test_escape_concat_path_quotes():
 
 def test_parse_out_time_ms():
     blob = "out_time_ms=2500000\nprogress=continue\n"
-    # 2_500_000 µs → 2500 ms
     assert _parse_out_time_ms(blob) == 2500.0
+
+
+def test_select_pipeline_prefers_cuda_full():
+    report = analyze_compatibility([_media("a.mp4", w=1920), _media("b.mp4", w=1280, h=720)])
+    gpu = GpuCapabilities(nvenc=True, cuda_decode=True, scale_cuda=True, encoder="h264_nvenc")
+    assert select_pipeline(report, gpu) is Pipeline.CUDA_FULL
+
+
+def test_select_pipeline_falls_to_nvenc():
+    report = analyze_compatibility([_media("a.mp4", w=1920), _media("b.mp4", w=1280, h=720)])
+    gpu = GpuCapabilities(nvenc=True, cuda_decode=False, scale_cuda=True, encoder="h264_nvenc")
+    assert select_pipeline(report, gpu) is Pipeline.NVENC
+
+
+def test_build_cuda_full_command_uses_hwaccel_and_scale_cuda(tmp_path: Path):
+    items = [
+        _media(str(tmp_path / "a.mp4"), w=1920),
+        _media(str(tmp_path / "b.mp4"), w=1280, h=720),
+    ]
+    report = analyze_compatibility(items)
+    cmd, encoder = build_command(items, tmp_path / "out.mp4", report, Pipeline.CUDA_FULL)
+    assert encoder == "h264_nvenc+cuda"
+    assert cmd.count("-hwaccel") == 2
+    assert "scale_cuda=" in " ".join(cmd)
+    assert "h264_nvenc" in cmd

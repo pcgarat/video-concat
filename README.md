@@ -2,7 +2,7 @@
 # Video Concat
 
 Concatenador de MP4 con interfaz gráfica PySide6, estrategia automática
-**copy / NVENC**, dockerizado y listo para tu RTX.
+**copy / CUDA full / NVENC / CPU**, dockerizado y listo para tu RTX.
 
 ## Idea clave
 
@@ -10,8 +10,15 @@ Si los clips son compatibles (mismo códec, resolución, fps y audio), se usa
 `ffmpeg concat` con `-c copy`: no hay recodificación ni uso de GPU — es lo más
 rápido y sin pérdida.
 
-Si no lo son, se normaliza y recodifica. Con NVIDIA disponible usa `h264_nvenc`;
-si falla, cae a `libx264` sin tumbar la app.
+Si no lo son, se normaliza y recodifica con esta cascada:
+
+1. **CUDA full** — NVDEC + `scale_cuda` + `h264_nvenc`
+2. **NVENC** — decode/scale CPU + `h264_nvenc`
+3. **CPU** — `libx264`
+
+> El filtro `concat` de ffmpeg no trabaja con frames CUDA: `pad`/`fps`/`concat`
+> siguen en CPU tras un `hwdownload` mínimo. Aun así, decode y scale (lo caro
+> en resolución alta) ocurren en la GPU.
 
 ## Requisitos
 

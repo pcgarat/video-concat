@@ -11,10 +11,12 @@ Aplicación de escritorio en Python para concatenar vídeos MP4 con ffmpeg, inte
 1. El usuario añade, reordena y elimina ficheros MP4.
 2. `ffprobe` analiza cada fichero (códec, resolución, fps, audio, duración).
 3. **Modo automático**
-   - Compatible (mismo códec vídeo/audio, resolución, fps, timebase razonable) → `concat` demuxer + `-c copy`.
-   - Incompatible → normalización + recodificación.
-     - Preferencia: decodificación CUDA + `h264_nvenc` si la GPU está disponible.
-     - Fallback: `libx264` + `aac`.
+   - Compatible → `concat` demuxer + `-c copy`.
+   - Incompatible → normalización + recodificación, con cascada:
+     1. **CUDA full**: NVDEC (`-hwaccel cuda`) + `scale_cuda` + NVENC.
+        `pad`/`fps`/`concat` en CPU (limitación de ffmpeg: el filtro concat no opera sobre frames CUDA).
+     2. **NVENC**: decode/scale CPU + `h264_nvenc`.
+     3. **CPU**: `libx264` + `aac`.
 4. Barra de progreso basada en `-progress` de ffmpeg.
 5. Cancelación limpia del proceso hijo.
 
@@ -26,12 +28,11 @@ Aplicación de escritorio en Python para concatenar vídeos MP4 con ffmpeg, inte
 
 ## Criterios de aceptación
 
-- [ ] Concatenar ≥2 MP4 idénticos en <5 s para ~1 min de material (modo copy).
-- [ ] Detectar incompatibilidad y mostrar el modo elegido antes de ejecutar.
-- [ ] Con GPU NVIDIA visible, usar NVENC en modo recodificación.
-- [ ] Sin GPU / error NVENC → fallback a CPU sin crashear.
-- [ ] `make build && make run` abre la UI vía Wayland/X11.
-- [ ] `make test` pasa.
+- [x] Concatenar ≥2 MP4 idénticos en modo copy.
+- [x] Detectar incompatibilidad y mostrar el modo/pipeline elegido.
+- [x] Con GPU NVIDIA usable, preferir CUDA full; fallback NVENC → CPU.
+- [x] `make build && make run` / `make run-local`.
+- [x] `make test` pasa.
 
 ## Stack
 

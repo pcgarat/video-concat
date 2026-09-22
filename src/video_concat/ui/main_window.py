@@ -23,8 +23,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from video_concat.core.compatibility import CompatibilityReport, ConcatMode, analyze_compatibility
-from video_concat.core.concat import ConcatError, ConcatJob, ConcatResult
+from video_concat.core.compatibility import CompatibilityReport, analyze_compatibility
+from video_concat.core.concat import ConcatError, ConcatJob, ConcatResult, Pipeline, select_pipeline
 from video_concat.core.gpu import GpuCapabilities, detect_gpu
 from video_concat.core.probe import MediaInfo, ProbeError, probe_many
 from video_concat.ui.styles import APP_STYLE, COLORS
@@ -133,7 +133,7 @@ class MainWindow(QMainWindow):
         brand_col = QVBoxLayout()
         brand = QLabel("VIDEO CONCAT")
         brand.setObjectName("Brand")
-        tagline = QLabel("Montaje MP4 · copy inteligente · NVENC cuando hace falta")
+        tagline = QLabel("Montaje MP4 · copy inteligente · CUDA full cuando hace falta")
         tagline.setObjectName("Tagline")
         brand_col.addWidget(brand)
         brand_col.addWidget(tagline)
@@ -259,12 +259,20 @@ class MainWindow(QMainWindow):
         self.addAction(open_act)
 
     def _paint_gpu_pill(self) -> None:
-        if self._gpu.available:
-            self.gpu_label.setText("GPU · NVENC listo")
+        if self._gpu.cuda_full:
+            self.gpu_label.setText("GPU · CUDA full")
             self.gpu_label.setStyleSheet(
                 f"background-color: {COLORS['ok_soft']}; color: {COLORS['ok']};"
             )
-            tip = "h264_nvenc disponible para recodificación"
+            tip = "NVDEC + scale_cuda + h264_nvenc"
+        elif self._gpu.nvenc:
+            self.gpu_label.setText("GPU · NVENC")
+            self.gpu_label.setStyleSheet(
+                f"background-color: {COLORS['ok_soft']}; color: {COLORS['ok']};"
+            )
+            tip = "h264_nvenc listo; CUDA full no disponible"
+            if self._gpu.reasons:
+                tip += " — " + "; ".join(self._gpu.reasons)
         else:
             self.gpu_label.setText("CPU · sin NVENC")
             self.gpu_label.setStyleSheet(
@@ -400,7 +408,8 @@ class MainWindow(QMainWindow):
             return
 
         assert self._report is not None
-        if self._report.mode is ConcatMode.COPY:
+        pipeline = select_pipeline(self._report, self._gpu)
+        if pipeline is Pipeline.COPY:
             self.mode_pill.setText("Modo COPY · sin recodificar")
             self.mode_pill.setStyleSheet(
                 f"background-color: {COLORS['ok_soft']}; color: {COLORS['ok']};"
@@ -410,15 +419,25 @@ class MainWindow(QMainWindow):
                 "sin pérdida de calidad ni uso de GPU."
             )
         else:
-            encoder = "h264_nvenc" if self._gpu.available else "libx264"
-            self.mode_pill.setText(f"Modo REENCODE · {encoder}")
+            labels = {
+                Pipeline.CUDA_FULL: "REENCODE · CUDA full (NVDEC+scale+NVENC)",
+                Pipeline.NVENC: "REENCODE · NVENC (decode CPU)",
+                Pipeline.CPU: "REENCODE · CPU (libx264)",
+            }
+            self.mode_pill.setText(labels[pipeline])
             self.mode_pill.setStyleSheet(
                 f"background-color: {COLORS['warn_soft']}; color: {COLORS['warn']};"
             )
             reasons = "\n".join(f"• {r}" for r in self._report.reasons[:6])
             extra = "" if len(self._report.reasons) <= 6 else "\n• …"
+            note = (
+                "\n\nNota: pad/fps/concat van en CPU; ffmpeg no concatena frames CUDA."
+                if pipeline is Pipeline.CUDA_FULL
+                else ""
+            )
             self.mode_detail.setText(
-                f"Hay diferencias entre clips. Se normalizará y recodificará.\n{reasons}{extra}"
+                f"Hay diferencias entre clips. Se normalizará y recodificará.\n"
+                f"{reasons}{extra}{note}"
             )
 
     def _update_actions(self) -> None:
@@ -495,7 +514,8 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Completado",
-            f"Guardado en:\n{result.output}\n\nEncoder: {result.used_encoder}",
+            f"Guardado en:\n{result.output}\n\n"
+            f"Pipeline: {result.pipeline}\nEncoder: {result.used_encoder}",
         )
 
     @Slot(str)

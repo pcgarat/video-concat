@@ -1,0 +1,29 @@
+services:
+  video-concat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: video-concat:local
+    gpus:
+      - driver: nvidia
+        count: all
+        capabilities: [gpu, video, compute, utility]
+    network_mode: host
+    environment:
+      DISPLAY: ${DISPLAY}
+      WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-wayland-0}
+      XDG_RUNTIME_DIR: /tmp/runtime-user
+      QT_QPA_PLATFORM: ${QT_QPA_PLATFORM:-wayland}
+      QT_X11_NO_MITSHM: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility,graphics
+    volumes:
+      - ${VIDEO_MEDIA_DIR:-${HOME}/Videos}:/media
+      - ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY:-wayland-0}:/tmp/runtime-user/${WAYLAND_DISPLAY:-wayland-0}
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${HOME}/.Xauthority:/home/ubuntu/.Xauthority:ro
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+    working_dir: /media

@@ -124,6 +124,127 @@ QPushButton#Danger {{
     border-color: {COLORS["danger"]};
     color: {COLORS["danger"]};
 }}
+QPushButton#Variant {{
+    background-color: {COLORS["surface_raised"]};
+    border: 1px solid {COLORS["line"]};
+    border-radius: 12px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    color: {COLORS["ink_muted"]};
+}}
+QPushButton#Variant:hover {{
+    color: {COLORS["ink"]};
+    border-color: {COLORS["ink_muted"]};
+}}
+QFrame#ClipRow {{
+    background-color: {COLORS["surface_raised"]};
+    border: 1px solid {COLORS["line"]};
+    border-left: 4px solid {COLORS["line"]};
+    border-radius: 6px;
+}}
+QFrame#ClipRow:hover {{
+    border-color: {COLORS["ink_muted"]};
+}}
+QFrame#ClipRow[selected="true"] {{
+    border-left: 4px solid {COLORS["accent"]};
+    background-color: #FFFDFA;
+}}
+QFrame#ClipRow[dropTarget="true"] {{
+    border-top: 2px solid {COLORS["accent"]};
+}}
+QLabel#RowHandle {{
+    color: {COLORS["line"]};
+    font-size: 16px;
+}}
+QLabel#RowTitle {{
+    font-weight: 600;
+    font-size: 13px;
+    color: {COLORS["ink"]};
+}}
+QLabel#RowDetail {{
+    color: {COLORS["ink_muted"]};
+    font-size: 11px;
+}}
+QLabel#RowTags {{
+    font-size: 11px;
+    font-weight: 600;
+}}
+QFrame#ClipTile {{
+    background-color: {COLORS["surface"]};
+    border: 1px solid {COLORS["line"]};
+    border-radius: 5px;
+}}
+QFrame#ClipTile:hover {{
+    border-color: {COLORS["ink_muted"]};
+}}
+QFrame#ClipTile[active="true"] {{
+    background-color: #FFFDFA;
+    border: 1px solid {COLORS["accent"]};
+    border-left: 3px solid {COLORS["accent"]};
+}}
+QLabel#TileName {{
+    font-size: 11px;
+    font-weight: 600;
+    color: {COLORS["ink"]};
+}}
+QLabel#TileDetail, QLabel#TileStatus {{
+    font-size: 10px;
+    color: {COLORS["ink_muted"]};
+}}
+QPushButton#TilePlay {{
+    background-color: {COLORS["surface_raised"]};
+    border: 1px solid {COLORS["line"]};
+    border-radius: 12px;
+    padding: 0px;
+    font-size: 11px;
+    font-weight: 600;
+    color: {COLORS["ink"]};
+}}
+QPushButton#TilePlay:hover {{
+    background-color: {COLORS["accent"]};
+    border-color: {COLORS["accent"]};
+    color: {COLORS["surface_raised"]};
+}}
+QPushButton#TileDetach {{
+    background-color: {COLORS["surface_raised"]};
+    border: 1px solid {COLORS["line"]};
+    border-radius: 3px;
+    padding: 0px;
+    font-size: 10px;
+    font-weight: 600;
+    color: {COLORS["ink_muted"]};
+}}
+QPushButton#TileDetach:hover {{
+    background-color: {COLORS["accent"]};
+    border-color: {COLORS["accent"]};
+    color: {COLORS["surface_raised"]};
+}}
+QPushButton#TileDetach:checked {{
+    background-color: {COLORS["accent"]};
+    border-color: {COLORS["accent"]};
+    color: {COLORS["surface_raised"]};
+}}
+QPushButton#TileDetach:disabled {{
+    color: #B4C0C9;
+    background-color: transparent;
+    border-color: #DDE5EA;
+}}
+QAbstractButton#FollowSwitch {{
+    background: transparent;
+    border: none;
+}}
+QScrollArea#TileScroller {{
+    background-color: transparent;
+    border: none;
+}}
+QScrollArea {{
+    background-color: transparent;
+    border: none;
+}}
+QScrollArea > QWidget > QWidget {{
+    background-color: transparent;
+}}
 QLineEdit {{
     background-color: {COLORS["surface_raised"]};
     border: 1px solid {COLORS["line"]};

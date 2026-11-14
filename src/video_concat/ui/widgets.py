@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QDrag, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -759,23 +759,28 @@ class MontageStrip(QWidget):
 
     El ancho de cada tramo es proporcional a la duración del clip. La fila de la
     lista que se resalta ilumina aquí su tramo, para no perder de vista qué clip
-    del montaje se está tocando.
+    del montaje se está tocando. Al pulsar un tramo se pide seleccionar su fila.
     """
+
+    segment_clicked = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._clips: list[tuple[MediaInfo, EdgeFrames | None]] = []
         self._rects: list[QRectF] = []
         self._highlight: Path | None = None
+        self._selected: Path | None = None
         self.setFixedHeight(MONTAGE_HEIGHT)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMouseTracking(True)
 
     def set_clips(self, clips: list[tuple[MediaInfo, EdgeFrames | None]]) -> None:
         self._clips = list(clips)
-        if self._highlight is not None and self._highlight not in {
-            media.path for media, _frames in self._clips
-        }:
+        known = {media.path for media, _frames in self._clips}
+        if self._highlight is not None and self._highlight not in known:
             self._highlight = None
+        if self._selected is not None and self._selected not in known:
+            self._selected = None
         self._layout()
         self.update()
 
@@ -787,9 +792,20 @@ class MontageStrip(QWidget):
         self.setToolTip(next((m.label for m, _f in self._clips if m.path == path), ""))
         self.update()
 
+    def set_selected(self, path: Path | None) -> None:
+        """Marca el tramo de la fila seleccionada; `None` lo apaga."""
+        if path == self._selected:
+            return
+        self._selected = path
+        self.update()
+
     @property
     def highlighted(self) -> Path | None:
         return self._highlight
+
+    @property
+    def selected(self) -> Path | None:
+        return self._selected
 
     def clip_paths(self) -> list[Path]:
         return [media.path for media, _frames in self._clips]
@@ -800,6 +816,33 @@ class MontageStrip(QWidget):
             if media.path == path:
                 return QRectF(rect)
         return None
+
+    def path_at(self, point: QPointF) -> Path | None:
+        """Clip cuyo tramo contiene el punto, o `None` si se pulsa fuera."""
+        for (media, _frames), rect in zip(self._clips, self._rects, strict=True):
+            if rect.contains(point):
+                return media.path
+        return None
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        over = self.path_at(event.position()) is not None
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor if over else Qt.CursorShape.ArrowCursor
+        )
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            path = self.path_at(event.position())
+            if path is not None:
+                self.segment_clicked.emit(path)
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -849,8 +892,15 @@ class MontageStrip(QWidget):
         rect: QRectF,
     ) -> None:
         hot = media.path == self._highlight
-        painter.setPen(QPen(QColor(COLORS["accent"] if hot else COLORS["line"]), 2 if hot else 1))
-        painter.setBrush(QColor(EMPTY_SURFACE if hot else COLORS["timeline_track"]))
+        chosen = media.path == self._selected
+        if chosen:
+            edge, fill, width = COLORS["ink"], "#FFFDFA", 2
+        elif hot:
+            edge, fill, width = COLORS["accent"], EMPTY_SURFACE, 2
+        else:
+            edge, fill, width = COLORS["line"], COLORS["timeline_track"], 1
+        painter.setPen(QPen(QColor(edge), width))
+        painter.setBrush(QColor(fill))
         painter.drawRoundedRect(rect, 3, 3)
 
         inner = rect.adjusted(2, 2, -2, -2)

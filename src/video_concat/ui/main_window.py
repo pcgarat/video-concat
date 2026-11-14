@@ -229,8 +229,10 @@ class MainWindow(QMainWindow):
         title.setObjectName("SectionTitle")
         self.montage = MontageStrip()
         self.montage.setToolTip(
-            "Montaje completo en orden de concatenación; pasa por una fila para resaltar su clip"
+            "Montaje en orden de concatenación: pasa por una fila para resaltar su clip "
+            "y pulsa un tramo para seleccionar su fila"
         )
+        self.montage.segment_clicked.connect(self._on_montage_segment_clicked)
         tf_layout.addWidget(title)
         tf_layout.addWidget(self.montage)
         layout.addWidget(timeline_frame)
@@ -568,13 +570,10 @@ class MainWindow(QMainWindow):
 
     def _refresh_montage(self) -> None:
         """Montaje completo: un tramo por fila visible con su clip activo."""
-        self.montage.set_clips(
-            [
-                (row.active.media, row.active.frames)
-                for row in self.rows.rows()
-                if not row.isHidden()
-            ]
-        )
+        rows = [row for row in self.rows.rows() if not row.isHidden()]
+        self.montage.set_clips([(row.active.media, row.active.frames) for row in rows])
+        chosen = next((row for row in rows if row.is_selected()), None)
+        self.montage.set_selected(chosen.active.media.path if chosen else None)
 
     def _render_rows(self, previous: dict[Path, Path]) -> None:
         self.rows.clear()
@@ -637,6 +636,24 @@ class MainWindow(QMainWindow):
             self.montage.set_highlight(None)
             return
         self.montage.set_highlight(path if isinstance(path, Path) else Path(str(path)))
+
+    @Slot(object)
+    def _on_montage_segment_clicked(self, path: object) -> None:
+        """Pulsar un tramo del montaje selecciona la fila que lo aporta."""
+        target = path if isinstance(path, Path) else Path(str(path))
+        index = next(
+            (
+                i
+                for i, row in enumerate(self.rows.rows())
+                if not row.isHidden() and row.active.media.path == target
+            ),
+            None,
+        )
+        if index is None:
+            log.warning("Tramo del montaje sin fila asociada: %s", target)
+            return
+        log.info("Montaje: seleccionada la fila %d (%s)", index + 1, target.name)
+        self._on_row_selected(index)
 
     def _keep_visible_selection(self, rows: list[ClipGroupRow]) -> None:
         """La fila seleccionada no puede quedar oculta por el filtro."""

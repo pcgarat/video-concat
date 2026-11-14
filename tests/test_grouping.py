@@ -12,7 +12,7 @@ from video_concat.core.frames import (
     signature_from_rgb,
     similarity,
 )
-from video_concat.core.grouping import GroupedClip, group_clips
+from video_concat.core.grouping import GroupedClip, follower_paths, group_clips
 from video_concat.core.probe import MediaInfo, StreamInfo
 
 
@@ -35,7 +35,12 @@ def _flat(value: float, rgb: tuple[float, float, float] | None = None) -> FrameS
 def _frames(first: FrameSignature, last: FrameSignature):
     from video_concat.core.frames import EdgeFrames
 
-    return EdgeFrames(first=first, last=last, preview_rgb=b"\x00" * (FRAME_SIZE * FRAME_SIZE * 3))
+    return EdgeFrames(
+        first=first,
+        last=last,
+        first_rgb=b"\x00" * (FRAME_SIZE * FRAME_SIZE * 3),
+        last_rgb=b"\x00" * (FRAME_SIZE * FRAME_SIZE * 3),
+    )
 
 
 def _solid_rgb(value: int) -> bytes:
@@ -113,7 +118,9 @@ class TestExtractEdgeFrames:
         edges = extract_edge_frames(clip, duration=0.5)
         assert len(edges.first.rgb) == GRID * GRID * 3
         assert similarity(edges.first, edges.last) > 0.9
-        assert len(edges.preview_rgb) == FRAME_SIZE * FRAME_SIZE * 3
+        frame_bytes = FRAME_SIZE * FRAME_SIZE * 3
+        assert len(edges.first_rgb) == frame_bytes
+        assert len(edges.last_rgb) == frame_bytes
 
 
 class TestGrouping:
@@ -170,8 +177,13 @@ class TestGrouping:
         names = [g.reference.media.path.name for g in groups]
         assert names == ["0.mp4", "1.mp4", "2.mp4"]
 
-    def test_row_goes_before_the_one_it_ends_like(self):
-        """Si el último de A coincide con el último de B, A precede a B."""
+    def test_rows_with_the_same_ending_stay_adjacent(self):
+        """
+        Dos filas que acaban igual van seguidas, no separadas por otra.
+
+        La relación es simétrica, así que el orden entre ellas es el previo;
+        lo que se afirma es la adyacencia, no una dirección concreta.
+        """
         a, b, c = _media("a.mp4"), _media("b.mp4"), _media("c.mp4")
         frames = {
             a.path: _frames(_flat(0.10), _flat(0.70)),
@@ -180,7 +192,22 @@ class TestGrouping:
         }
         groups = group_clips([b, a, c], frames)
         names = [g.reference.media.path.name for g in groups]
-        assert names.index("a.mp4") < names.index("b.mp4")
+        assert abs(names.index("a.mp4") - names.index("b.mp4")) == 1
+
+    def test_ends_alike_does_not_split_a_perfect_continuity_pair(self):
+        """La regla es desempate: no se cuela entre un par que encaja 1.0."""
+        a, b, c = _media("a.mp4"), _media("b.mp4"), _media("c.mp4")
+        frames = {
+            a.path: _frames(_flat(0.10), _flat(0.50)),
+            b.path: _frames(_flat(0.50), _flat(0.60)),
+            c.path: _frames(_flat(0.90), _flat(0.50)),
+        }
+        groups = group_clips([a, b, c], frames)
+        names = [g.reference.media.path.name for g in groups]
+        assert names.index("b.mp4") - names.index("a.mp4") == 1, (
+            "la fila que continúa al ancla no puede ser desplazada por una que "
+            "sólo comparte el fotograma final"
+        )
 
     def test_unanalysed_clips_survive_as_own_rows(self):
         a, b = _media("a.mp4"), _media("b.mp4")
@@ -222,3 +249,128 @@ class TestGrouping:
 
 def test_grouped_clip_comparable_flag():
     assert GroupedClip(_media("a.mp4")).comparable is False
+
+
+class TestFollowerFilter:
+    """«Mostrar siguientes»: solo sobreviven el ancla y quienes arrancan donde acaba."""
+
+    def _clip(self, name: str, first: float, last: float):
+        return _media(name), _frames(_flat(first), _flat(last))
+
+    def test_anchor_and_its_followers_survive(self):
+        a, fa = self._clip("a.mp4", 0.10, 0.50)
+        b, fb = self._clip("b.mp4", 0.50, 0.80)
+        c, fc = self._clip("c.mp4", 0.90, 0.95)
+        groups = group_clips([a, b, c], {a.path: fa, b.path: fb, c.path: fc})
+        kept = follower_paths(groups, a.path, 0.93)
+        assert kept == {a.path, b.path}
+
+    def test_anchor_always_survives(self):
+        a, fa = self._clip("a.mp4", 0.10, 0.50)
+        b, fb = self._clip("b.mp4", 0.95, 0.99)
+        groups = group_clips([a, b], {a.path: fa, b.path: fb})
+        assert follower_paths(groups, a.path, 0.93) == {a.path}
+
+    def test_threshold_loosens_the_filter(self):
+        a, fa = self._clip("a.mp4", 0.10, 0.50)
+        b, fb = self._clip("b.mp4", 0.56, 0.90)
+        groups = group_clips([a, b], {a.path: fa, b.path: fb})
+        assert follower_paths(groups, a.path, 0.999) == {a.path}
+        assert follower_paths(groups, a.path, 0.88) == {a.path, b.path}
+
+    def test_unknown_anchor_reports_no_filter(self):
+        a, fa = self._clip("a.mp4", 0.10, 0.50)
+        groups = group_clips([a], {a.path: fa})
+        assert follower_paths(groups, Path("nope.mp4"), 0.93) == set()
+
+    def test_followers_include_variants_in_other_rows(self):
+        """Una variante de otro grupo también puede continuar al ancla."""
+        a, fa = self._clip("a.mp4", 0.10, 0.50)
+        b, fb = self._clip("b.mp4", 0.50, 0.90)
+        c, fc = self._clip("c.mp4", 0.50, 0.70)
+        groups = group_clips([a, b, c], {a.path: fa, b.path: fb, c.path: fc})
+        kept = follower_paths(groups, a.path, 0.93)
+        assert {b.path, c.path} <= kept
+
+    def test_unreadable_clips_never_follow(self):
+        a, fa = self._clip("a.mp4", 0.10, 0.50)
+        b = _media("b.mp4")
+        groups = group_clips([a, b], {a.path: fa, b.path: FrameExtractError("boom")})
+        assert follower_paths(groups, a.path, 0.93) == {a.path}
+
+
+class TestClusterSafety:
+    def test_chain_of_similar_clips_does_not_collapse_endpoints(self):
+        """
+        El parecido se mide contra la referencia del grupo, no en cadena.
+
+        `a~b` y `b~c` superan el umbral pero `a~c` no: con union-find
+        transitivo los tres acababan en una fila, y como sólo hay un clip
+        activo por fila el tercero nunca podría concatenarse.
+        """
+        a, b, c = _media("a.mp4"), _media("b.mp4"), _media("c.mp4")
+        frames = {
+            a.path: _frames(_flat(0.00), _flat(0.00)),
+            b.path: _frames(_flat(0.04), _flat(0.04)),
+            c.path: _frames(_flat(0.09), _flat(0.09)),
+        }
+        groups = group_clips([a, b, c], frames, threshold=0.93)
+        sizes = sorted(len(g.members) for g in groups)
+        assert sizes == [1, 2], (
+            "c no puede acabar en la fila de a sólo por parecerse a b"
+        )
+        tail = next(g for g in groups if len(g.members) == 1)
+        assert tail.reference.media.path.name == "c.mp4"
+
+    def test_similar_pair_shares_one_row(self):
+        a, b, c = _media("a.mp4"), _media("b.mp4"), _media("c.mp4")
+        frames = {
+            a.path: _frames(_flat(0.00), _flat(0.00)),
+            b.path: _frames(_flat(0.01), _flat(0.01)),
+            c.path: _frames(_flat(0.50), _flat(0.50)),
+        }
+        groups = group_clips([a, b, c], frames, threshold=0.93)
+        sizes = sorted(len(g.members) for g in groups)
+        assert sizes == [1, 2]
+
+
+class TestUncomparableRows:
+    def test_unreadable_clip_is_not_placed_first(self):
+        """Una fila sin firmas no puede arrancar la cadena narrativa."""
+        a, b, c = _media("a.mp4"), _media("b.mp4"), _media("c.mp4")
+        frames = {
+            a.path: _frames(_flat(0.10), _flat(0.50)),
+            b.path: FrameExtractError("ilegible"),
+            c.path: _frames(_flat(0.50), _flat(0.90)),
+        }
+        groups = group_clips([a, b, c], frames)
+        names = [g.reference.media.path.name for g in groups]
+        assert names.index("b.mp4") > names.index("a.mp4"), (
+            "el clip ilegible se colaba delante del plano de apertura"
+        )
+
+
+class TestUnknownDuration:
+    def test_zero_duration_does_not_reuse_the_first_frame(self, tmp_path: Path):
+        """Con duración 0 no se puede asumir que el último frame es el primero."""
+        import shutil
+        import subprocess
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            pytest.skip("ffmpeg no disponible")
+        clip = tmp_path / "clip.mp4"
+        subprocess.run(
+            [
+                ffmpeg, "-v", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=red:s=64x64:d=0.5:r=16",
+                "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=0.5:r=16",
+                "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+                "-map", "[v]", "-pix_fmt", "yuv420p", str(clip),
+            ],
+            check=True,
+        )
+        edges = extract_edge_frames(clip, duration=0.0)
+        assert similarity(edges.first, edges.last) < 0.9, (
+            "el último fotograma no puede ser una copia del primero"
+        )

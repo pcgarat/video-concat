@@ -18,10 +18,16 @@ Aplicación de escritorio en Python para concatenar vídeos MP4 con ffmpeg, inte
      coinciden o casi coinciden (umbral configurable, por defecto `0.93`).
    - Dos clips que solo comparten uno de los dos extremos **no** se agrupan: evita
      falsos positivos entre clips consecutivos de una misma secuencia.
+   - La pertenencia se mide **contra la referencia del grupo**, no en cadena:
+     `A~B` y `B~C` sobre el umbral no fusionan `A` con `C`. Con un único clip
+     activo por fila, una fusión transitiva dejaría un clip que nunca podría
+     concatenarse.
    - Orden inicial: se encadena por continuidad (`último(A) ≈ primero(B)`).
-     Si el último de A coincide con el último de B, A va justo antes de B.
-   - El usuario puede reordenar arrastrando filas; ese orden manual manda y no
-     lo sobrescribe el encadenado automático.
+     Las filas con el mismo último fotograma van seguidas; la regla actúa como
+     desempate y no se cuela entre un par que encaja exactamente. Las filas sin
+     firmas (clip ilegible) se colocan al final y no arrancan la cadena.
+   - El usuario puede reordenar arrastrando filas; ese orden **persiste** en el
+     modelo y manda sobre el encadenado automático, incluso al añadir clips.
 5. **Una versión por fila**: cada fila tiene exactamente un clip activo. Se
    selecciona haciendo clic en la fila; si la fila agrupa varias variantes, se
    alterna con el botón de variante.
@@ -61,10 +67,12 @@ Aplicación de escritorio en Python para concatenar vídeos MP4 con ffmpeg, inte
 - [x] Concatenar ≥2 MP4 idénticos en modo copy.
 - [x] Detectar incompatibilidad y mostrar el modo/pipeline elegido.
 - [x] Con GPU NVIDIA usable, preferir CUDA full; fallback NVENC → CPU.
-- [x] Agrupar en una fila los clips con primer y último fotograma equivalentes.
-- [x] Orden inicial por continuidad y reordenado manual por arrastre.
+- [x] Agrupar en una fila los clips con primer y último fotograma equivalentes,
+      sin fusiones transitivas que pierdan clips.
+- [x] Orden inicial por continuidad y reordenado manual persistente.
 - [x] Un único clip activo por fila; concatenar en orden de filas.
-- [x] Miniatura del primer fotograma y reproducción inline por fila.
+- [x] Primer y último fotograma visibles por clip; play en el reproductor del sistema.
+- [x] Los tests de UI generan sus propios clips (no dependen de samples gitignored).
 - [x] `make build && make run` / `make run-local`.
 - [x] `make test` pasa.
 

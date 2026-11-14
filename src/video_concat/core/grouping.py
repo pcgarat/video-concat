@@ -50,33 +50,72 @@ class ClipGroup:
         return self.reference
 
 
-def _merge(index_of: dict[int, int], a: int, b: int) -> None:
-    ra, rb = index_of[a], index_of[b]
-    if ra == rb:
-        return
-    for key, root in index_of.items():
-        if root == rb:
-            index_of[key] = ra
-
-
 def _cluster(clips: list[GroupedClip], threshold: float) -> list[list[int]]:
-    """Union-find sobre clips que coinciden a la vez en primer y último fotograma."""
-    index_of = {i: i for i in range(len(clips))}
-    for i, left in enumerate(clips):
-        for j in range(i + 1, len(clips)):
-            right = clips[j]
-            if not (left.comparable and right.comparable):
-                continue
-            assert left.frames is not None and right.frames is not None
-            opening = similarity(left.frames.first, right.frames.first)
-            closing = similarity(left.frames.last, right.frames.last)
-            if opening >= threshold and closing >= threshold:
-                _merge(index_of, i, j)
+    """
+    Agrupa por parecido de extremos, acotando cada grupo a su referencia.
 
-    buckets: dict[int, list[int]] = {}
-    for i in range(len(clips)):
-        buckets.setdefault(index_of[i], []).append(i)
-    return [buckets[root] for root in sorted(buckets)]
+    Sin la acotación, la transitividad del union-find fusiona A con C cuando
+    `A~B` y `B~C` superan el umbral pero `A~C` no, y como sólo hay un clip
+    activo por fila el tercero nunca podría concatenarse: una pérdida que
+    ninguna acción de la UI puede deshacer.
+    """
+    buckets: list[list[int]] = []
+    for i, clip in enumerate(clips):
+        if not clip.comparable:
+            buckets.append([i])
+            continue
+        assert clip.frames is not None
+        placed = False
+        for bucket in buckets:
+            head = clips[bucket[0]]
+            if not head.comparable:
+                continue
+            assert head.frames is not None
+            opening = similarity(clip.frames.first, head.frames.first)
+            closing = similarity(clip.frames.last, head.frames.last)
+            if opening >= threshold and closing >= threshold:
+                bucket.append(i)
+                placed = True
+                break
+        if not placed:
+            buckets.append([i])
+    return buckets
+
+
+def continuation_score(source: EdgeFrames | None, candidate: EdgeFrames | None) -> float:
+    """Cuánto continúa `candidate` a `source`: primer fotograma frente a último de `source`."""
+    if source is None or candidate is None:
+        return 0.0
+    return similarity(source.last, candidate.first)
+
+
+def continues(source: EdgeFrames | None, candidate: EdgeFrames | None, threshold: float) -> bool:
+    """¿`candidate` arranca donde termina `source`? Criterio del filtro «mostrar siguientes»."""
+    return continuation_score(source, candidate) >= threshold
+
+
+def follower_paths(groups: list[ClipGroup], anchor: Path | str, threshold: float) -> set[Path]:
+    """
+    Clips que arrancan donde termina el clip ancla, más el propio ancla.
+
+    El ancla siempre se conserva: es la tarjeta que lleva el interruptor y sin
+    ella no habría forma de desactivar el filtro. Un ancla inexistente devuelve
+    el conjunto vacío, que el llamante interpreta como «sin filtro».
+    """
+    anchor_path = Path(anchor)
+    reference = next(
+        (m for g in groups for m in g.members if m.media.path == anchor_path), None
+    )
+    if reference is None:
+        return set()
+    kept = {reference.media.path}
+    for group in groups:
+        for member in group.members:
+            if member.media.path == reference.media.path:
+                continue
+            if continues(reference.frames, member.frames, threshold):
+                kept.add(member.media.path)
+    return kept
 
 
 def _continuity(left: ClipGroup, right: ClipGroup) -> float:
@@ -97,23 +136,31 @@ def _ends_alike(left: ClipGroup, right: ClipGroup) -> float:
 
 
 def _chain(groups: list[ClipGroup], threshold: float) -> list[ClipGroup]:
-    """Orden narrativo: cada fila va tras la que termina donde ella empieza."""
-    if len(groups) < 2:
-        return groups
+    """
+    Orden narrativo: cada fila va tras la que termina donde ella empieza.
+
+    Las filas sin firmas comparables no participan: si entraran, todas sus
+    aristas valdrían 0 y la de menor `best_incoming` (justo una de ellas)
+    arrancaría la cadena, colocando un clip ilegible delante del plano de
+    apertura real. Se encadenan aparte y se devuelven al final.
+    """
+    chained = [g for g in groups if g.first_signature is not None]
+    stuck = [g for g in groups if g.first_signature is None]
+    if len(chained) < 2:
+        return chained + stuck
 
     links = [
-        [0.0 if i == j else _continuity(a, b) for j, b in enumerate(groups)]
-        for i, a in enumerate(groups)
+        [0.0 if i == j else _continuity(a, b) for j, b in enumerate(chained)]
+        for i, a in enumerate(chained)
     ]
-
     def best_incoming(idx: int) -> float:
-        return max((links[i][idx] for i in range(len(groups)) if i != idx), default=0.0)
+        return max((links[i][idx] for i in range(len(chained)) if i != idx), default=0.0)
 
     # Arranca la fila que menos continúa a otra: el principio de la cadena.
-    start = min(range(len(groups)), key=lambda i: (round(best_incoming(i), 4), i))
+    start = min(range(len(chained)), key=lambda i: (round(best_incoming(i), 4), i))
 
     ordered_idx = [start]
-    remaining = set(range(len(groups))) - {start}
+    remaining = set(range(len(chained))) - {start}
     while remaining:
         current = ordered_idx[-1]
         strong = [j for j in remaining if links[current][j] >= threshold]
@@ -122,27 +169,48 @@ def _chain(groups: list[ClipGroup], threshold: float) -> list[ClipGroup]:
         ordered_idx.append(nxt)
         remaining.remove(nxt)
 
-    return [groups[i] for i in ordered_idx]
+    return [chained[i] for i in ordered_idx] + stuck
 
 
 def _apply_ends_alike(groups: list[ClipGroup], threshold: float) -> list[ClipGroup]:
     """
-    Regla explícita del usuario: si el último fotograma de un clip coincide con el
-    último de otro, su fila va justo antes de la fila del otro.
+    Regla explícita: si el último fotograma de una fila coincide con el de otra,
+    van seguidas, y el orden entre ambas es el que ya traían.
+
+    La relación de finales coincidentes es simétrica, así que exigir "A antes
+    que B" para todo par con el mismo final no tiene solución única: se agrupa
+    por finales parecidos y se respeta el orden previo dentro de cada bloque.
+    Se aplica como desempate, nunca por encima de la continuidad: si la cadena
+    ya puso a `anchor` seguida de la fila que empieza exactamente donde acaba,
+    no se cuela entre ellas una fila que sólo comparte el fotograma final.
     """
-    consumed: set[int] = set()
-    ordered: list[ClipGroup] = []
-    for i, anchor in enumerate(groups):
-        if i in consumed:
-            continue
-        consumed.add(i)
-        ordered.append(anchor)
-        for j in range(i + 1, len(groups)):
-            if j in consumed:
-                continue
-            if _ends_alike(anchor, groups[j]) >= threshold:
-                consumed.add(j)
-                ordered.append(groups[j])
+    if len(groups) < 2:
+        return groups
+
+    ordered = list(groups)
+    for _ in range(len(ordered)):
+        changed = False
+        for i in range(len(ordered) - 1):
+            anchor, successor = ordered[i], ordered[i + 1]
+            for j in range(i + 2, len(ordered)):
+                candidate = ordered[j]
+                alike = _ends_alike(anchor, candidate)
+                if alike < threshold:
+                    continue
+                # La regla gana cuando el parecido de finales supera a la
+                # continuidad que ofrece el sucesor actual: dos filas que acaban
+                # igual pertenecen juntas, aunque otra empiece donde acaba ésta.
+                if max(alike, _continuity(anchor, candidate)) <= _continuity(
+                    anchor, successor
+                ):
+                    continue
+                ordered.insert(i + 1, ordered.pop(j))
+                changed = True
+                break
+            if changed:
+                break
+        if not changed:
+            break
     return ordered
 
 

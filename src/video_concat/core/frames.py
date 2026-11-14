@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,11 +79,12 @@ def similarity(a: FrameSignature, b: FrameSignature) -> float:
 
 @dataclass(frozen=True, slots=True)
 class EdgeFrames:
-    """Fotogramas extremos de un clip, más el primero listo como miniatura."""
+    """Fotogramas extremos de un clip: firma para comparar y RGB para pintarlos."""
 
     first: FrameSignature
     last: FrameSignature
-    preview_rgb: bytes
+    first_rgb: bytes
+    last_rgb: bytes
     preview_size: int = FRAME_SIZE
 
 
@@ -125,9 +128,19 @@ def _grab_first(path: Path, timeout: float) -> bytes:
 
 
 def _grab_last(path: Path, duration: float, timeout: float) -> bytes:
-    """Decodifica la cola del clip y devuelve el último frame completo."""
+    """
+    Decodifica la cola del clip y devuelve el último frame completo.
+
+    Con `duration <= 0` el contenedor no declara duración: buscar desde
+    `duration - 0.25` daría `-ss 0.000`, es decir el primer fotograma, y el
+    clip quedaría etiquetado como «primero == último». En ese caso sólo se
+    usa `-sseof`, y si no produce frames se falla en vez de mentir.
+    """
     frame_bytes = FRAME_SIZE * FRAME_SIZE * 3
-    seeks = [["-sseof", "-0.25"], ["-ss", f"{max(0.0, duration - 0.25):.3f}"]]
+    seeks = [["-sseof", "-0.25"]]
+    if duration > 0:
+        seeks.append(["-ss", f"{max(0.0, duration - 0.25):.3f}"])
+
     last_error: FrameExtractError | None = None
     for seek in seeks:
         try:
@@ -154,23 +167,39 @@ def extract_edge_frames(path: Path, duration: float = 0.0, timeout: float = 60.0
     return EdgeFrames(
         first=signature_from_rgb(first_raw),
         last=signature_from_rgb(last_raw),
-        preview_rgb=first_raw,
+        first_rgb=first_raw,
+        last_rgb=last_raw,
     )
 
 
 def extract_many(
-    entries: list[tuple[Path, float]], max_workers: int = 4
+    entries: list[tuple[Path, float]],
+    max_workers: int = 4,
+    on_progress: Callable[[int, int], None] | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[Path, EdgeFrames | Exception]:
-    """Extrae en paralelo; devuelve el error por clip en lugar de abortar la tanda."""
+    """
+    Extrae en paralelo; devuelve el error por clip en lugar de abortar la tanda.
+
+    `cancel` permite parar entre clips. Es la alternativa cooperativa a
+    `QThread.terminate()`: matar el hilo dejaría los ffmpeg hijos huérfanos.
+    """
     if not entries:
         return {}
     workers = max(1, min(max_workers, len(entries)))
     results: dict[Path, EdgeFrames | Exception] = {}
+    done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(extract_edge_frames, p, d): p for p, d in entries}
-        for fut, path in futures.items():
+        for fut in as_completed(futures):
+            path = futures[fut]
             try:
                 results[path] = fut.result()
             except Exception as exc:  # noqa: BLE001 — se devuelve al llamante
                 results[path] = exc
+            done += 1
+            if on_progress is not None:
+                on_progress(done, len(entries))
+            if cancel is not None and cancel.is_set():
+                break
     return results

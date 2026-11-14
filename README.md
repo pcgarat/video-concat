@@ -26,13 +26,32 @@ En vez de un listado plano, los clips se agrupan en **filas**:
 
 - Una fila reúne los clips cuyo **primer y último fotograma** coinciden o casi
   coinciden (umbral ajustable, `0.93` por defecto). Son variantes del mismo plano.
-- El orden inicial encadena por continuidad: `último(A) ≈ primero(B)`. Si dos
-  clips acaban igual, el primero va justo antes del otro.
-- Arrastra las filas para reordenar; ese orden manda sobre el automático.
-- Cada fila tiene **un solo clip activo** (clic en la fila; botón de variante si
-  agrupa varios). Se muestra miniatura del primer fotograma y se reproduce en la
-  propia fila con el play.
-- La concatenación respeta el orden de las filas y usa el clip activo de cada una.
+- **Cada clip de la fila se muestra en la misma línea**, con su primer fotograma
+  y su último fotograma agrupados (etiquetas «primero» y «último») y un botón ▶.
+- El ancho de las tarjetas se reparte según cuántos clips tenga el grupo: las
+  miniaturas se encogen hasta `52 px` para que todos quepan; a partir de ahí la
+  fila se desplaza en horizontal, sin perder la línea única.
+- El parecido se mide contra la referencia del grupo, no en cadena: si `A~B` y
+  `B~C` superan el umbral pero `A~C` no, no se fusionan los tres. Con un solo
+  clip activo por fila, una fusión así dejaría un clip que nunca podría
+  concatenarse.
+- El orden inicial encadena por continuidad: `último(A) ≈ primero(B)`. Las filas
+  cuyo último fotograma coincide van seguidas, y esa regla actúa como desempate:
+  no se cuela entre un par que encaja exactamente.
+- Las filas sin firmas (clip ilegible) no arrancan la cadena: se colocan al final.
+- Arrastra las filas por el asa `⠿` para reordenar; ese orden **persiste** y manda
+  sobre el automático, incluso al añadir clips nuevos.
+- Clic en un clip lo marca como **activo** de su fila; solo ese se concatena.
+- Cada tarjeta lleva un **interruptor «mostrar siguientes»**: al encenderlo, solo
+  quedan a la vista los clips cuyo **primer fotograma coincide (o casi) con el
+  último** del clip del interruptor, usando el umbral del desplegable. El clip del
+  interruptor se mantiene siempre visible para poder apagarlo.
+- Solo puede haber **un filtro activo**: encender otro interruptor mueve el filtro.
+  El botón «Mostrar todo» de la cabecera lo quita.
+- ▶ abre el clip en el **reproductor del sistema** (`QDesktopServices.openUrl`),
+  sin decodificar dentro de la app.
+- La concatenación respeta el orden de las filas y usa el clip activo de cada fila
+  visible: lo filtrado no entra en la salida.
 
 ## Requisitos
 
@@ -92,5 +111,5 @@ make run MEDIA_DIR=/ruta/a/tus/videos
 ```
 src/video_concat/
   core/     probe, frames (fotogramas), grouping (filas), compatibilidad, concat, GPU
-  ui/       PySide6 (mesa de montaje: filas arrastrables + reproductor inline)
+  ui/       PySide6 (mesa de montaje: filas con sus clips en línea + play externo)
 ```

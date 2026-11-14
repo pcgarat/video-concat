@@ -170,6 +170,50 @@ QLabel#RowTags {{
     font-size: 11px;
     font-weight: 600;
 }}
+QFrame#ClipTile {{
+    background-color: {COLORS["surface"]};
+    border: 1px solid {COLORS["line"]};
+    border-radius: 5px;
+}}
+QFrame#ClipTile:hover {{
+    border-color: {COLORS["ink_muted"]};
+}}
+QFrame#ClipTile[active="true"] {{
+    background-color: #FFFDFA;
+    border: 1px solid {COLORS["accent"]};
+    border-left: 3px solid {COLORS["accent"]};
+}}
+QLabel#TileName {{
+    font-size: 11px;
+    font-weight: 600;
+    color: {COLORS["ink"]};
+}}
+QLabel#TileDetail, QLabel#TileStatus {{
+    font-size: 10px;
+    color: {COLORS["ink_muted"]};
+}}
+QPushButton#TilePlay {{
+    background-color: {COLORS["surface_raised"]};
+    border: 1px solid {COLORS["line"]};
+    border-radius: 12px;
+    padding: 0px;
+    font-size: 11px;
+    font-weight: 600;
+    color: {COLORS["ink"]};
+}}
+QPushButton#TilePlay:hover {{
+    background-color: {COLORS["accent"]};
+    border-color: {COLORS["accent"]};
+    color: {COLORS["surface_raised"]};
+}}
+QAbstractButton#FollowSwitch {{
+    background: transparent;
+    border: none;
+}}
+QScrollArea#TileScroller {{
+    background-color: transparent;
+    border: none;
+}}
 QScrollArea {{
     background-color: transparent;
     border: none;

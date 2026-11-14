@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -27,7 +28,7 @@ from video_concat.core.compatibility import CompatibilityReport, analyze_compati
 from video_concat.core.concat import ConcatError, ConcatJob, ConcatResult, Pipeline, select_pipeline
 from video_concat.core.frames import DEFAULT_THRESHOLD, EdgeFrames, extract_many
 from video_concat.core.gpu import GpuCapabilities, detect_gpu
-from video_concat.core.grouping import ClipGroup, group_clips
+from video_concat.core.grouping import ClipGroup, follower_paths, group_clips
 from video_concat.core.probe import MediaInfo, ProbeError, probe_file
 from video_concat.logutil import get_logger
 from video_concat.ui.formatting import format_duration
@@ -35,11 +36,12 @@ from video_concat.ui.styles import APP_STYLE, COLORS
 from video_concat.ui.widgets import (
     ClipGroupRow,
     GroupRowList,
-    InlinePlayback,
     TimelineStrip,
 )
 
 VIDEO_FILTER = "Vídeos MP4 (*.mp4 *.MP4)"
+# Espera máxima por hilo al cerrar; nunca se mata el hilo (dejaría ffmpeg huérfanos).
+CLOSE_WAIT_MS = 15000
 THRESHOLDS = (
     ("0.97 · solo idénticos", 0.97),
     ("0.93 · recomendado", 0.93),
@@ -88,22 +90,37 @@ class FramesWorker(QObject):
     progress = Signal(float, str)
     # object: las claves son Path y Qt no sabe convertir dict con claves no-String.
     finished = Signal(object)
+    failed = Signal(str)
 
     def __init__(self, entries: list[tuple[Path, float]]) -> None:
         super().__init__()
         self.entries = entries
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        """Pide parar entre clips; `QThread.quit()` no basta sin event loop."""
+        self._cancel.set()
 
     @Slot()
     def run(self) -> None:
         log.info("FramesWorker arranca (%d clips)", len(self.entries))
+        total = len(self.entries) or 1
+
+        def report(done: int, _total: int) -> None:
+            self.progress.emit(done / total, f"Fotogramas {done}/{total}")
+
         self.progress.emit(0.0, "Comparando primer y último fotograma…")
         try:
-            results = extract_many(self.entries)
+            results = extract_many(
+                self.entries, on_progress=report, cancel=self._cancel
+            )
             log.info("FramesWorker OK (%d clips)", len(results))
             self.finished.emit(results)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("FramesWorker error inesperado")
-            self.finished.emit({})
+            # Un fallo de la tanda no puede parecer «todo listo»: se distingue
+            # de un resultado vacío legítimo con una señal propia.
+            self.failed.emit(f"No se pudieron comparar los fotogramas: {exc}")
 
 
 class ConcatWorker(QObject):
@@ -159,8 +176,9 @@ class MainWindow(QMainWindow):
         self._media: dict[Path, MediaInfo] = {}
         self._frames: dict[Path, EdgeFrames | Exception] = {}
         self._groups: list[ClipGroup] = []
-        self._selection: list[int] = []
         self._threshold = DEFAULT_THRESHOLD
+        self._order: list[Path] = []
+        self._follow_anchor: Path | None = None
         self._report: CompatibilityReport | None = None
         self._gpu = detect_gpu()
         self._probe_thread: QThread | None = None
@@ -169,7 +187,6 @@ class MainWindow(QMainWindow):
         self._frames_worker: FramesWorker | None = None
         self._concat_thread: QThread | None = None
         self._concat_worker: ConcatWorker | None = None
-        self._playback: InlinePlayback | None = None
         self._busy = False
         log.info("GPU detectada: %s (cuda_full=%s)", self._gpu, self._gpu.cuda_full)
 
@@ -188,7 +205,7 @@ class MainWindow(QMainWindow):
         brand_col = QVBoxLayout()
         brand = QLabel("VIDEO CONCAT")
         brand.setObjectName("Brand")
-        tagline = QLabel("Montaje por fotogramas · un clip por fila · copy inteligente")
+        tagline = QLabel("Montaje por fotogramas · todos los clips de una fila a la vista")
         tagline.setObjectName("Tagline")
         brand_col.addWidget(brand)
         brand_col.addWidget(tagline)
@@ -222,6 +239,12 @@ class MainWindow(QMainWindow):
         list_title.setObjectName("SectionTitle")
         head.addWidget(list_title)
         head.addStretch(1)
+        self.btn_show_all = QPushButton("Mostrar todo")
+        self.btn_show_all.setObjectName("Variant")
+        self.btn_show_all.setToolTip("Quitar el filtro «mostrar siguientes»")
+        self.btn_show_all.setVisible(False)
+        self.btn_show_all.clicked.connect(self._clear_follow_filter)
+        head.addWidget(self.btn_show_all)
         self.threshold_box = QComboBox()
         for label, value in THRESHOLDS:
             self.threshold_box.addItem(label, value)
@@ -246,8 +269,9 @@ class MainWindow(QMainWindow):
 
         self.empty_hint = QLabel(
             "Arrastra MP4 aquí o usa «Añadir…».\n\n"
-            "Cada fila agrupa los clips que empiezan y acaban con el mismo fotograma.\n"
-            "Haz clic en una fila para elegirla: solo se concatenará una versión por fila."
+            "Cada fila agrupa los clips que empiezan y acaban con el mismo fotograma;\n"
+            "se ven todos en línea con su primer y último fotograma.\n"
+            "El interruptor de cada tarjeta deja a la vista solo los clips que siguen al suyo."
         )
         self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_hint.setStyleSheet(f"color: {COLORS['ink_muted']};")
@@ -446,6 +470,7 @@ class MainWindow(QMainWindow):
         ]
         if not pending:
             self._rebuild_groups()
+            self._set_busy(False, f"{len(self._media)} clip(s) listos")
             return
 
         self.progress.setValue(500)
@@ -460,7 +485,11 @@ class MainWindow(QMainWindow):
         self._frames_worker.finished.connect(
             self._on_frames_ok, Qt.ConnectionType.QueuedConnection
         )
+        self._frames_worker.failed.connect(
+            self._on_frames_fail, Qt.ConnectionType.QueuedConnection
+        )
         self._frames_worker.finished.connect(self._frames_thread.quit)
+        self._frames_worker.failed.connect(self._frames_thread.quit)
         self._frames_thread.finished.connect(self._on_frames_thread_finished)
         self._frames_thread.start()
 
@@ -482,25 +511,35 @@ class MainWindow(QMainWindow):
         self._rebuild_groups()
         self._set_busy(False, f"{len(self._media)} clip(s) listos")
 
+    @Slot(str)
+    def _on_frames_fail(self, message: str) -> None:
+        log.error("Análisis de fotogramas falló: %s", message)
+        self.progress.setValue(0)
+        self._set_busy(False, "Error al comparar fotogramas")
+        QMessageBox.warning(self, "Fotogramas", message)
+
     @Slot()
     def _on_frames_thread_finished(self) -> None:
         self._frames_worker = None
         self._frames_thread = None
 
     # --- Agrupado / filas ---
-    def _rebuild_groups(
-        self, ordered_paths: list[Path] | None = None, keep_order: bool = False
-    ) -> None:
+    def _rebuild_groups(self) -> None:
+        """
+        Recalcula el agrupado y repinta las filas.
+
+        El orden manual del usuario vive en `self._order` y manda siempre que
+        exista: un flag por llamada no servía, porque la ingesta de un clip
+        nuevo reconstruía con los valores por defecto y revertía el arrastre.
+        """
         items = list(self._media.values())
         by_path = {m.path: m for m in items}
-        if ordered_paths is not None:
-            items = [by_path[p] for p in ordered_paths if p in by_path]
-        elif keep_order:
-            current = [row.group.reference.media.path for row in self.rows.rows()]
-            if current:
-                ordered = [by_path[p] for p in current if p in by_path]
-                ordered += [m for m in items if m.path not in set(current)]
-                items = ordered
+        ordered: list[MediaInfo] = []
+        if self._order:
+            ordered = [by_path[p] for p in self._order if p in by_path]
+            placed = {m.path for m in ordered}
+            ordered += [m for m in items if m.path not in placed]
+        items = ordered or items
 
         previous = {
             row.group.reference.media.path: row.active.media.path for row in self.rows.rows()
@@ -509,9 +548,10 @@ class MainWindow(QMainWindow):
             items,
             self._frames,
             self._threshold,
-            preserve_input_order=keep_order or ordered_paths is not None,
+            preserve_input_order=bool(self._order),
         )
         self._render_rows(previous)
+        self._apply_follow_filter()
 
         if not self.output_edit.text() and items:
             self.output_edit.setText(str(items[0].path.with_name("concat_output.mp4")))
@@ -521,7 +561,6 @@ class MainWindow(QMainWindow):
 
     def _render_rows(self, previous: dict[Path, Path]) -> None:
         self.rows.clear()
-        self._selection = []
         if not self._groups:
             self.empty_hint.show()
             self.rows.hide()
@@ -532,7 +571,8 @@ class MainWindow(QMainWindow):
         for index, group in enumerate(self._groups):
             row = ClipGroupRow(group, index)
             row.selected.connect(self._on_row_selected)
-            row.player.play_requested.connect(self._toggle_playback)
+            row.play_requested.connect(self._open_in_system_player)
+            row.follow_toggled.connect(self._on_follow_toggled)
             active_path = previous.get(group.reference.media.path)
             if active_path is not None:
                 for member_index, member in enumerate(group.members):
@@ -540,37 +580,89 @@ class MainWindow(QMainWindow):
                         row.set_active_member(member_index)
                         break
             self.rows.add_row(row)
-            self._selection.append(0)
 
-        if self._selection:
+        if self.rows.rows():
             self._on_row_selected(0)
+
+    # --- Filtro «mostrar siguientes» ---
+    def _apply_follow_filter(self) -> None:
+        """
+        Recalcula qué tarjetas sobreviven al filtro del interruptor.
+
+        El filtro es único: solo puede estar encendida la tarjeta ancla. Si el
+        ancla desapareció de la lista, el filtro se retira solo.
+        """
+        kept = None
+        if self._follow_anchor is not None:
+            kept = follower_paths(self._groups, self._follow_anchor, self._threshold)
+            if not kept:
+                log.info("Ancla de filtro ausente (%s): se muestra todo", self._follow_anchor)
+                self._follow_anchor = None
+
+        rows = self.rows.rows()
+        for row in rows:
+            row.apply_follow_filter(kept)
+            row.sync_follow_switches(self._follow_anchor)
+            row.setVisible(kept is None or bool(row.visible_tiles))
+
+        self.btn_show_all.setVisible(self._follow_anchor is not None)
+        self._keep_visible_selection(rows)
+
+    def _keep_visible_selection(self, rows: list[ClipGroupRow]) -> None:
+        """La fila seleccionada no puede quedar oculta por el filtro."""
+        if not rows:
+            return
+        selected = next((i for i, row in enumerate(rows) if row.is_selected()), None)
+        if selected is not None and not rows[selected].isHidden():
+            self._on_row_selected(selected)
+            return
+        self._on_row_selected(next((i for i, row in enumerate(rows) if not row.isHidden()), 0))
+
+    @Slot(object, bool)
+    def _on_follow_toggled(self, path: object, checked: bool) -> None:
+        anchor = path if isinstance(path, Path) else Path(str(path))
+        self._follow_anchor = anchor if checked else None
+        log.info("Filtro «mostrar siguientes» → %s", self._follow_anchor or "desactivado")
+        self._apply_follow_filter()
+        self.status_label.setText(
+            f"Mostrando lo que sigue a {anchor.name}" if checked else "Mostrando todos los clips"
+        )
+
+    @Slot()
+    def _clear_follow_filter(self) -> None:
+        if self._follow_anchor is None:
+            return
+        log.info("Filtro «mostrar siguientes» desactivado desde la cabecera")
+        self._follow_anchor = None
+        self._apply_follow_filter()
+        self.status_label.setText("Mostrando todos los clips")
 
     @Slot(int)
     def _on_row_selected(self, index: int) -> None:
-        if not (0 <= index < len(self._selection)):
+        if not self.rows.rows():
             return
         for row in self.rows.rows():
             row.set_selected(row.index == index)
-            if row.index == index:
-                self._selection[index] = row.active_index
         self.timeline.set_items(self._selected_media())
         self._update_selection_detail()
         self._update_actions()
 
     @Slot()
     def _on_rows_reordered(self) -> None:
-        order = [row.group.reference.media.path for row in self.rows.rows()]
-        by_path = {m.path: m for m in self._media.values()}
-        self._media = {p: by_path[p] for p in order if p in by_path}
-        self._rebuild_groups(keep_order=True)
+        """Fija el orden manual usando TODOS los miembros, no sólo la referencia.
+
+        Con sólo la referencia, arrastrar una fila con variantes borraba del
+        modelo los miembros no activos y el clip desaparecía sin aviso.
+        """
+        ordered: list[Path] = []
+        for row in self.rows.rows():
+            ordered.extend(member.media.path for member in row.group.members)
+        self._order = ordered
+        self._rebuild_groups()
 
     def _selected_media(self) -> list[MediaInfo]:
-        """Un clip por fila, en el orden actual de las filas."""
-        selected: list[MediaInfo] = []
-        for row in self.rows.rows():
-            member = row.group.resolve(self._selection[row.index])
-            selected.append(member.media)
-        return selected
+        """Un clip por fila visible (el activo), en el orden actual de las filas."""
+        return [row.active.media for row in self.rows.rows() if not row.isHidden()]
 
     def _update_selection_detail(self) -> None:
         selected = self._selected_media()
@@ -588,7 +680,7 @@ class MainWindow(QMainWindow):
         self._threshold = float(self.threshold_box.itemData(index))
         log.info("Umbral de agrupado → %.2f", self._threshold)
         if self._media:
-            self._rebuild_groups(keep_order=True)
+            self._rebuild_groups()
 
     # --- Acciones sobre clips ---
     def _remove_selection(self) -> None:
@@ -596,21 +688,23 @@ class MainWindow(QMainWindow):
         if current is None or not self._groups:
             return
         group = self._groups[current]
-        active = group.resolve(self._selection[current] if current < len(self._selection) else 0)
+        active = group.resolve(self.rows.rows()[current].active_index)
         remaining = [m for m in group.members if m is not active]
         del self._media[active.media.path]
 
         if not remaining:
             self._frames.pop(active.media.path, None)
         log.info("Quitado %s (quedan %d en su fila)", active.media.label, len(remaining))
-        self._rebuild_groups(keep_order=True)
+        self._rebuild_groups()
         self.status_label.setText(f"Quitado {active.media.label}")
 
     def _clear_all(self) -> None:
         self._media.clear()
         self._frames.clear()
         self._groups = []
-        self._selection = []
+        self._order = []
+        self._follow_anchor = None
+        self.btn_show_all.setVisible(False)
         self.rows.clear()
         self.empty_hint.show()
         self.rows.hide()
@@ -619,21 +713,16 @@ class MainWindow(QMainWindow):
         self._update_actions()
         self.status_label.setText("Lista vacía")
 
-    def _toggle_playback(self, media: object) -> None:
+    def _open_in_system_player(self, media: object) -> None:
         if not isinstance(media, MediaInfo):
             return
-        slot = next(
-            (row.player for row in self.rows.rows() if row.active.media.path == media.path),
-            None,
-        )
-        if slot is None:
+        url = QUrl.fromLocalFile(str(media.path))
+        if not QDesktopServices.openUrl(url):
+            log.warning("No se pudo abrir %s con el reproductor del sistema", media.path)
+            self.status_label.setText(f"No se pudo abrir {media.label}")
             return
-        if self._playback is None:
-            self._playback = InlinePlayback(self)
-        self._playback.toggle(media, slot)
-        self.status_label.setText(
-            f"Reproduciendo {media.label}" if self._playback.current else "Listo"
-        )
+        log.info("Reproducción externa: %s", media.path)
+        self.status_label.setText(f"Abriendo {media.label} en el reproductor del sistema")
 
     # --- Modo / acciones ---
     def _update_mode_panel(self) -> None:
@@ -797,16 +886,26 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Cancelando…")
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        """
+        Cierra cancelando de verdad: nunca `terminate()` sobre un hilo vivo.
+
+        `quit()` no interrumpe un worker bloqueado en `subprocess.run`, así que
+        para el hilo de fotogramas se pide cancelación cooperativa (entre
+        clips) y se espera. Matar el hilo dejaría ffmpeg huérfanos y podría
+        abortar el proceso al destruir el `QThread`.
+        """
         log.info("Cerrando ventana")
-        if self._playback is not None:
-            self._playback.stop()
         if self._concat_worker:
             self._concat_worker.cancel()
+        if self._frames_worker is not None:
+            self._frames_worker.cancel()
+
         for thread in (self._probe_thread, self._frames_thread, self._concat_thread):
             if thread is not None and thread.isRunning():
                 thread.quit()
-                if not thread.wait(5000):
-                    log.warning("Hilo no terminó a tiempo; se fuerza terminación")
-                    thread.terminate()
-                    thread.wait(1000)
+                if not thread.wait(CLOSE_WAIT_MS):
+                    log.warning(
+                        "Hilo aún ocupado al cerrar; se espera sin terminar el proceso"
+                    )
+                    thread.wait(CLOSE_WAIT_MS)
         event.accept()

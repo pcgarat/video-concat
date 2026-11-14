@@ -247,6 +247,40 @@ class TestGrouping:
         assert math.isfinite(group.score)
 
 
+class TestDetachedClips:
+    """Sacar un clip de su fila a mano sobrevive a los recálculos del agrupado."""
+
+    def test_detached_clip_stays_alone(self):
+        a, b = _media("a.mp4"), _media("b.mp4")
+        same = _frames(_flat(0.30), _flat(0.70))
+        frames = {a.path: same, b.path: same}
+        groups = group_clips([a, b], frames, detached={b.path})
+        sizes = sorted(len(g.members) for g in groups)
+        assert sizes == [1, 1], "el clip separado no puede volver a su fila"
+
+    def test_detached_row_is_labelled(self):
+        from video_concat.core.grouping import DETACHED_ORIGIN
+
+        a, b = _media("a.mp4"), _media("b.mp4")
+        same = _frames(_flat(0.30), _flat(0.70))
+        groups = group_clips([a, b], {a.path: same, b.path: same}, detached={b.path})
+        alone = next(g for g in groups if g.reference.media.path == b.path)
+        assert alone.origin == DETACHED_ORIGIN
+        assert len(alone.members) == 1
+
+    def test_detaching_one_keeps_the_rest_grouped(self):
+        clips = [_media(f"{i}.mp4") for i in range(3)]
+        same = _frames(_flat(0.30), _flat(0.70))
+        groups = group_clips(clips, {c.path: same for c in clips}, detached={clips[1].path})
+        sizes = sorted(len(g.members) for g in groups)
+        assert sizes == [1, 2]
+
+    def test_detached_set_is_optional(self):
+        a, b = _media("a.mp4"), _media("b.mp4")
+        same = _frames(_flat(0.30), _flat(0.70))
+        assert len(group_clips([a, b], {a.path: same, b.path: same}, detached=None)) == 1
+
+
 def test_grouped_clip_comparable_flag():
     assert GroupedClip(_media("a.mp4")).comparable is False
 

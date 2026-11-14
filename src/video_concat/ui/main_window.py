@@ -36,7 +36,7 @@ from video_concat.ui.styles import APP_STYLE, COLORS
 from video_concat.ui.widgets import (
     ClipGroupRow,
     GroupRowList,
-    TimelineStrip,
+    MontageStrip,
 )
 
 VIDEO_FILTER = "Vídeos MP4 (*.mp4 *.MP4)"
@@ -178,6 +178,8 @@ class MainWindow(QMainWindow):
         self._groups: list[ClipGroup] = []
         self._threshold = DEFAULT_THRESHOLD
         self._order: list[Path] = []
+        # Clips sacados de su fila a mano: el agrupado automático no los reabsorbe.
+        self._detached: set[Path] = set()
         self._follow_anchor: Path | None = None
         self._report: CompatibilityReport | None = None
         self._gpu = detect_gpu()
@@ -223,11 +225,14 @@ class MainWindow(QMainWindow):
         tf_layout = QVBoxLayout(timeline_frame)
         tf_layout.setContentsMargins(12, 6, 12, 6)
         tf_layout.setSpacing(2)
-        title = QLabel("LÍNEA DE TIEMPO")
+        title = QLabel("MONTAJE · PRIMER Y ÚLTIMO FOTOGRAMA")
         title.setObjectName("SectionTitle")
-        self.timeline = TimelineStrip()
+        self.montage = MontageStrip()
+        self.montage.setToolTip(
+            "Montaje completo en orden de concatenación; pasa por una fila para resaltar su clip"
+        )
         tf_layout.addWidget(title)
-        tf_layout.addWidget(self.timeline)
+        tf_layout.addWidget(self.montage)
         layout.addWidget(timeline_frame)
 
         body = QHBoxLayout()
@@ -271,7 +276,8 @@ class MainWindow(QMainWindow):
             "Arrastra MP4 aquí o usa «Añadir…».\n\n"
             "Cada fila agrupa los clips que empiezan y acaban con el mismo fotograma;\n"
             "se ven todos en línea con su primer y último fotograma.\n"
-            "El interruptor de cada tarjeta deja a la vista solo los clips que siguen al suyo."
+            "El interruptor de cada tarjeta deja a la vista solo los clips que siguen al suyo;\n"
+            "pasa por una fila para destacar su clip en el montaje de arriba."
         )
         self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_hint.setStyleSheet(f"color: {COLORS['ink_muted']};")
@@ -549,15 +555,26 @@ class MainWindow(QMainWindow):
             self._frames,
             self._threshold,
             preserve_input_order=bool(self._order),
+            detached=self._detached,
         )
         self._render_rows(previous)
         self._apply_follow_filter()
 
         if not self.output_edit.text() and items:
             self.output_edit.setText(str(items[0].path.with_name("concat_output.mp4")))
-        self.timeline.set_items(self._selected_media())
+        self._refresh_montage()
         self._update_mode_panel()
         self._update_actions()
+
+    def _refresh_montage(self) -> None:
+        """Montaje completo: un tramo por fila visible con su clip activo."""
+        self.montage.set_clips(
+            [
+                (row.active.media, row.active.frames)
+                for row in self.rows.rows()
+                if not row.isHidden()
+            ]
+        )
 
     def _render_rows(self, previous: dict[Path, Path]) -> None:
         self.rows.clear()
@@ -572,7 +589,11 @@ class MainWindow(QMainWindow):
             row = ClipGroupRow(group, index)
             row.selected.connect(self._on_row_selected)
             row.play_requested.connect(self._open_in_system_player)
+            row.detach_requested.connect(self._on_detach_requested)
             row.follow_toggled.connect(self._on_follow_toggled)
+            row.hover_changed.connect(self._on_row_hovered)
+            for tile in row.tiles:
+                tile.set_detach_checked(tile.clip.media.path in self._detached)
             active_path = previous.get(group.reference.media.path)
             if active_path is not None:
                 for member_index, member in enumerate(group.members):
@@ -607,6 +628,15 @@ class MainWindow(QMainWindow):
 
         self.btn_show_all.setVisible(self._follow_anchor is not None)
         self._keep_visible_selection(rows)
+        self._refresh_montage()
+
+    @Slot(object)
+    def _on_row_hovered(self, path: object) -> None:
+        """Hover de una fila → su clip se destaca en el montaje completo."""
+        if path is None:
+            self.montage.set_highlight(None)
+            return
+        self.montage.set_highlight(path if isinstance(path, Path) else Path(str(path)))
 
     def _keep_visible_selection(self, rows: list[ClipGroupRow]) -> None:
         """La fila seleccionada no puede quedar oculta por el filtro."""
@@ -619,8 +649,11 @@ class MainWindow(QMainWindow):
         self._on_row_selected(next((i for i, row in enumerate(rows) if not row.isHidden()), 0))
 
     @Slot(object, bool)
-    def _on_follow_toggled(self, path: object, checked: bool) -> None:
-        anchor = path if isinstance(path, Path) else Path(str(path))
+    def _on_follow_toggled(self, media: object, checked: bool) -> None:
+        if isinstance(media, MediaInfo):
+            anchor = media.path
+        else:
+            anchor = Path(str(media))
         self._follow_anchor = anchor if checked else None
         log.info("Filtro «mostrar siguientes» → %s", self._follow_anchor or "desactivado")
         self._apply_follow_filter()
@@ -637,13 +670,90 @@ class MainWindow(QMainWindow):
         self._apply_follow_filter()
         self.status_label.setText("Mostrando todos los clips")
 
+    @Slot(object, bool)
+    def _on_detach_requested(self, path: object, separated: bool) -> None:
+        """Saca el clip a una fila propia debajo, o lo devuelve a la suya."""
+        if isinstance(path, MediaInfo):
+            resolved = path.path
+        elif isinstance(path, Path):
+            resolved = path
+        else:
+            resolved = Path(str(path))
+        if separated:
+            self._detach_clip(resolved)
+        else:
+            self._reattach_clip(resolved)
+
+    def _detach_clip(self, path: Path) -> None:
+        """
+        Materializa el orden actual y coloca el clip justo tras sus variantes.
+
+        El agrupado automático fusionaría otra vez el clip en el siguiente
+        recálculo, así que la separación se guarda en `_detached` (el agrupado
+        deja de juntarlo) y en `_order` (queda inmediatamente debajo de donde
+        estaba). Es el mismo precio que paga el arrastre: el orden pasa a ser
+        manual y el encadenado por fotogramas deja de reordenar las filas.
+        """
+        row = next(
+            (r for r in self.rows.rows() if any(t.clip.media.path == path for t in r.tiles)),
+            None,
+        )
+        if row is None:
+            return
+        siblings = [t.clip.media.path for t in row.tiles if t.clip.media.path != path]
+        if not siblings:
+            self.status_label.setText("Ese clip ya está solo en su fila")
+            self._sync_detach_switch(path, False)
+            return
+
+        order = [p for p in self._current_order() if p != path]
+        position = order.index(siblings[-1]) + 1
+        order.insert(position, path)
+        self._detached.add(path)
+        self._order = order
+
+        label = self._media[path].label if path in self._media else path.name
+        log.info("Clip separado a fila propia: %s", path)
+        self._rebuild_groups()
+        self.status_label.setText(f"{label} movido a una fila propia")
+
+    def _reattach_clip(self, path: Path) -> None:
+        """
+        Devuelve el clip a la fila de sus variantes: el agrupado vuelve a juntarlo.
+
+        No se toca `_order`: con la marca fuera, el agrupado rehace el grupo y la
+        posición la decide el orden manual ya fijado.
+        """
+        if path not in self._detached:
+            return
+        self._detached.discard(path)
+        label = self._media[path].label if path in self._media else path.name
+        log.info("Clip devuelto a su fila: %s", path)
+        self._rebuild_groups()
+        self.status_label.setText(f"{label} devuelto a su fila")
+
+    def _sync_detach_switch(self, path: Path, checked: bool) -> None:
+        """Refleja el estado real en el botón ↓ sin reemitir la señal."""
+        for row in self.rows.rows():
+            for tile in row.tiles:
+                if tile.clip.media.path == path:
+                    tile.set_detach_checked(checked)
+                    return
+
+    def _current_order(self) -> list[Path]:
+        """Orden de todos los clips; completa la cola con los que aún no estén en `_order`."""
+        if not self._order:
+            return [m.media.path for row in self.rows.rows() for m in row.group.members]
+        placed = set(self._order)
+        return list(self._order) + [p for p in self._media if p not in placed]
+
     @Slot(int)
     def _on_row_selected(self, index: int) -> None:
         if not self.rows.rows():
             return
         for row in self.rows.rows():
             row.set_selected(row.index == index)
-        self.timeline.set_items(self._selected_media())
+        self._refresh_montage()
         self._update_selection_detail()
         self._update_actions()
 
@@ -694,6 +804,8 @@ class MainWindow(QMainWindow):
 
         if not remaining:
             self._frames.pop(active.media.path, None)
+        self._detached.discard(active.media.path)
+        self._order = [p for p in self._order if p != active.media.path]
         log.info("Quitado %s (quedan %d en su fila)", active.media.label, len(remaining))
         self._rebuild_groups()
         self.status_label.setText(f"Quitado {active.media.label}")
@@ -703,12 +815,13 @@ class MainWindow(QMainWindow):
         self._frames.clear()
         self._groups = []
         self._order = []
+        self._detached.clear()
         self._follow_anchor = None
         self.btn_show_all.setVisible(False)
         self.rows.clear()
         self.empty_hint.show()
         self.rows.hide()
-        self.timeline.set_items([])
+        self.montage.set_clips([])
         self._update_mode_panel()
         self._update_actions()
         self.status_label.setText("Lista vacía")

@@ -8,6 +8,9 @@ from pathlib import Path
 from video_concat.core.frames import DEFAULT_THRESHOLD, EdgeFrames, FrameSignature, similarity
 from video_concat.core.probe import MediaInfo
 
+# Origen de una fila creada al sacar un clip de su grupo a mano.
+DETACHED_ORIGIN = "separado manualmente"
+
 
 @dataclass(frozen=True, slots=True)
 class GroupedClip:
@@ -50,7 +53,11 @@ class ClipGroup:
         return self.reference
 
 
-def _cluster(clips: list[GroupedClip], threshold: float) -> list[list[int]]:
+def _cluster(
+    clips: list[GroupedClip],
+    threshold: float,
+    detached: set[Path] | None = None,
+) -> list[list[int]]:
     """
     Agrupa por parecido de extremos, acotando cada grupo a su referencia.
 
@@ -58,10 +65,14 @@ def _cluster(clips: list[GroupedClip], threshold: float) -> list[list[int]]:
     `A~B` y `B~C` superan el umbral pero `A~C` no, y como sólo hay un clip
     activo por fila el tercero nunca podría concatenarse: una pérdida que
     ninguna acción de la UI puede deshacer.
+
+    Los clips en `detached` van siempre solos: el usuario los sacó de su fila
+    a mano y un recálculo no puede devolverlos a ella.
     """
+    excluded = detached or set()
     buckets: list[list[int]] = []
     for i, clip in enumerate(clips):
-        if not clip.comparable:
+        if not clip.comparable or clip.media.path in excluded:
             buckets.append([i])
             continue
         assert clip.frames is not None
@@ -224,6 +235,7 @@ def group_clips(
     frames: dict[Path | str, EdgeFrames | Exception] | None = None,
     threshold: float = DEFAULT_THRESHOLD,
     preserve_input_order: bool = False,
+    detached: set[Path] | None = None,
 ) -> list[ClipGroup]:
     """
     Agrupa clips cuyo primer y último fotograma coinciden (o casi) y devuelve
@@ -231,11 +243,16 @@ def group_clips(
 
     Con `preserve_input_order` se respeta el orden recibido en lugar de encadenar
     por continuidad: así el reordenado manual del usuario no se deshace.
+
+    `detached` son los clips que el usuario sacó de su fila a mano: quedan
+    siempre solos, aunque sus extremos sigan coincidiendo con los de sus
+    variantes, y se marcan con `DETACHED_ORIGIN`.
     """
     if not items:
         return []
 
     lookup = frames or {}
+    excluded = detached or set()
 
     def frames_for(media: MediaInfo) -> tuple[EdgeFrames | None, str]:
         found = lookup.get(media.path)
@@ -252,12 +269,15 @@ def group_clips(
     ]
 
     groups: list[ClipGroup] = []
-    for bucket in _cluster(clip_list, threshold):
+    for bucket in _cluster(clip_list, threshold, excluded):
         members = [clip_list[i] for i in bucket]
         comparable = [c for c in members if c.comparable]
         if not comparable:
             for member in members:
                 groups.append(ClipGroup((member,), 0.0, member.problem or "sin comparación"))
+            continue
+        if len(members) == 1 and members[0].media.path in excluded:
+            groups.append(ClipGroup((members[0],), 0.0, DETACHED_ORIGIN))
             continue
         ref = comparable[0]
         assert ref.frames is not None

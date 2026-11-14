@@ -206,6 +206,30 @@ QPushButton#TilePlay:hover {{
     border-color: {COLORS["accent"]};
     color: {COLORS["surface_raised"]};
 }}
+QPushButton#TileDetach {{
+    background-color: {COLORS["surface_raised"]};
+    border: 1px solid {COLORS["line"]};
+    border-radius: 3px;
+    padding: 0px;
+    font-size: 10px;
+    font-weight: 600;
+    color: {COLORS["ink_muted"]};
+}}
+QPushButton#TileDetach:hover {{
+    background-color: {COLORS["accent"]};
+    border-color: {COLORS["accent"]};
+    color: {COLORS["surface_raised"]};
+}}
+QPushButton#TileDetach:checked {{
+    background-color: {COLORS["accent"]};
+    border-color: {COLORS["accent"]};
+    color: {COLORS["surface_raised"]};
+}}
+QPushButton#TileDetach:disabled {{
+    color: #B4C0C9;
+    background-color: transparent;
+    border-color: #DDE5EA;
+}}
 QAbstractButton#FollowSwitch {{
     background: transparent;
     border: none;

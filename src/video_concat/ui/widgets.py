@@ -23,12 +23,17 @@ from video_concat.core.grouping import ClipGroup, GroupedClip
 from video_concat.core.probe import MediaInfo
 from video_concat.ui.formatting import format_duration, format_size
 from video_concat.ui.layout_metrics import (
+    MONTAGE_CAPTION_H,
+    MONTAGE_EDGE,
+    MONTAGE_FRAME_MAX,
+    MONTAGE_HEIGHT,
     THUMB_MAX,
     TILE_CAP,
     TILE_GAP,
     TILE_HEAD_SPACING,
     TILE_PADDING,
     TILE_PLAY_SIZE,
+    montage_widths,
     tile_metrics,
 )
 from video_concat.ui.styles import COLORS
@@ -40,6 +45,8 @@ SCROLLBAR_RESERVE = 18
 # Interruptor «mostrar siguientes» del pie de la tarjeta.
 TOGGLE_WIDTH = 28
 TOGGLE_HEIGHT = 15
+# Botón «sacar a fila nueva» del pie de la tarjeta.
+TILE_DETACH_SIZE = 22
 
 
 class ElidedLabel(QLabel):
@@ -177,7 +184,10 @@ class ClipTile(QFrame):
 
     activated = Signal(object)
     play_requested = Signal(object)
+    detach_requested = Signal(object, bool)
     follow_toggled = Signal(object, bool)
+    hovered = Signal(object)
+    unhovered = Signal()
 
     def __init__(self, clip: GroupedClip, active: bool, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -186,8 +196,10 @@ class ClipTile(QFrame):
         self._active = active
         self._width = TILE_CAP
         self._thumb_side = THUMB_MAX
+        self._detach_available = False
         self.setFixedWidth(self._width)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Maximum)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(TILE_PADDING, 6, TILE_PADDING, 6)
@@ -234,6 +246,17 @@ class ClipTile(QFrame):
         footer = QHBoxLayout()
         footer.setSpacing(4)
         footer.addWidget(self.status, stretch=1)
+        self.btn_detach = QPushButton("↓")
+        self.btn_detach.setObjectName("TileDetach")
+        self.btn_detach.setCheckable(True)
+        self.btn_detach.setFixedSize(TILE_DETACH_SIZE, TILE_DETACH_SIZE)
+        self.btn_detach.setToolTip(
+            "Sacar este clip a una fila nueva justo debajo (vuelve a pulsar para devolverlo)"
+        )
+        self.btn_detach.toggled.connect(
+            lambda checked: self.detach_requested.emit(self.clip.media.path, checked)
+        )
+        footer.addWidget(self.btn_detach, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.follow_switch = ToggleSwitch()
         self.follow_switch.setObjectName("FollowSwitch")
         self.follow_switch.setToolTip(
@@ -282,6 +305,19 @@ class ClipTile(QFrame):
     def is_active(self) -> bool:
         return self._active
 
+    def set_detach_available(self, available: bool) -> None:
+        """Un clip solo no puede separarse… salvo que ya lo esté (para deshacerlo)."""
+        self._detach_available = available
+        self.btn_detach.setEnabled(available or self.btn_detach.isChecked())
+
+    def set_detach_checked(self, checked: bool) -> None:
+        """Marca el clip como separado sin reemitir `detach_requested`."""
+        button = self.btn_detach
+        button.blockSignals(True)
+        button.setChecked(checked)
+        button.blockSignals(False)
+        button.setEnabled(self._detach_available or checked)
+
     def set_follow_checked(self, checked: bool) -> None:
         """Sincroniza el interruptor sin reemitir `follow_toggled`."""
         switch = self.follow_switch
@@ -297,6 +333,14 @@ class ClipTile(QFrame):
             self.follow_switch.setToolTip(
                 "Sin fotogramas analizados: no se puede comparar con los demás clips"
             )
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self.hovered.emit(self)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.unhovered.emit()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
@@ -342,7 +386,9 @@ class ClipGroupRow(QFrame):
 
     selected = Signal(int)
     play_requested = Signal(object)
+    detach_requested = Signal(object, bool)
     follow_toggled = Signal(object, bool)
+    hover_changed = Signal(object)
 
     def __init__(self, group: ClipGroup, index: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -351,9 +397,12 @@ class ClipGroupRow(QFrame):
         self.index = index
         self._active = 0
         self._selected = False
+        self._hovered = False
         self._tiles: list[ClipTile] = []
         self._metrics: tuple[int, int] | None = None
         self._relayouting = False
+        # Sin esto el hover se pierde al entrar en una tarjeta hija.
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 6, 12, 6)
@@ -401,8 +450,12 @@ class ClipGroupRow(QFrame):
             tile = ClipTile(member, active=False)
             tile.activated.connect(self._on_tile_activated)
             tile.play_requested.connect(self.play_requested)
+            tile.detach_requested.connect(self.detach_requested)
             tile.follow_toggled.connect(self.follow_toggled)
+            tile.hovered.connect(self._on_tile_hovered)
+            tile.unhovered.connect(self._on_tile_unhovered)
             tile.set_follow_available()
+            tile.set_detach_available(len(group.members) > 1)
             self._strip_layout.insertWidget(self._strip_layout.count() - 1, tile)
             self._tiles.append(tile)
 
@@ -413,6 +466,34 @@ class ClipGroupRow(QFrame):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self.relayout_tiles()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._set_hovered(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._set_hovered(False)
+        super().leaveEvent(event)
+
+    def _set_hovered(self, hovered: bool) -> None:
+        if hovered == self._hovered:
+            return
+        self._hovered = hovered
+        # El montaje resalta el clip que aporta esta fila (el activo), no la variante 1.
+        self.hover_changed.emit(self.active.media.path if hovered else None)
+
+    def _on_tile_hovered(self, tile: ClipTile) -> None:
+        """Al entrar en una tarjeta concreta se resalta esa, aunque no sea la activa."""
+        if self._hovered:
+            self.hover_changed.emit(tile.clip.media.path)
+
+    def _on_tile_unhovered(self) -> None:
+        if self._hovered:
+            self.hover_changed.emit(self.active.media.path)
+
+    @property
+    def hovered(self) -> bool:
+        return self._hovered
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         """El viewport del scroller conoce su ancho definitivo tras el primer layout."""
@@ -465,6 +546,8 @@ class ClipGroupRow(QFrame):
     def set_active_member(self, index: int) -> None:
         self._active = index if 0 <= index < len(self.group.members) else 0
         self._refresh()
+        if self._hovered:
+            self.hover_changed.emit(self.active.media.path)
 
     @property
     def active(self) -> GroupedClip:
@@ -514,6 +597,9 @@ class ClipGroupRow(QFrame):
         self._active = self._tiles.index(tile)
         self._refresh()
         self.selected.emit(self.index)
+        if self._hovered:
+            # El clip del montaje cambia sin salir de la fila.
+            self.hover_changed.emit(self.active.media.path)
 
     def _sync_scroller_height(self) -> None:
         """
@@ -667,50 +753,139 @@ class GroupRowList(QWidget):
         return self._rows[index]
 
 
-class TimelineStrip(QWidget):
-    """Franja proporcional a la duración de cada clip — firma visual del producto."""
+class MontageStrip(QWidget):
+    """
+    Montaje completo: un tramo por clip, con su primer y su último fotograma.
+
+    El ancho de cada tramo es proporcional a la duración del clip. La fila de la
+    lista que se resalta ilumina aquí su tramo, para no perder de vista qué clip
+    del montaje se está tocando.
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._items: list[MediaInfo] = []
-        self.setMinimumHeight(38)
-        self.setMaximumHeight(42)
+        self._clips: list[tuple[MediaInfo, EdgeFrames | None]] = []
+        self._rects: list[QRectF] = []
+        self._highlight: Path | None = None
+        self.setFixedHeight(MONTAGE_HEIGHT)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def set_items(self, items: list[MediaInfo]) -> None:
-        self._items = list(items)
+    def set_clips(self, clips: list[tuple[MediaInfo, EdgeFrames | None]]) -> None:
+        self._clips = list(clips)
+        if self._highlight is not None and self._highlight not in {
+            media.path for media, _frames in self._clips
+        }:
+            self._highlight = None
+        self._layout()
         self.update()
+
+    def set_highlight(self, path: Path | None) -> None:
+        """Ilumina el tramo del clip; `None` apaga el resaltado."""
+        if path == self._highlight:
+            return
+        self._highlight = path
+        self.setToolTip(next((m.label for m, _f in self._clips if m.path == path), ""))
+        self.update()
+
+    @property
+    def highlighted(self) -> Path | None:
+        return self._highlight
+
+    def clip_paths(self) -> list[Path]:
+        return [media.path for media, _frames in self._clips]
+
+    def rect_for(self, path: Path) -> QRectF | None:
+        """Rectángulo de un clip; útil para pruebas y para depurar el reparto."""
+        for (media, _frames), rect in zip(self._clips, self._rects, strict=True):
+            if media.path == path:
+                return QRectF(rect)
+        return None
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._layout()
+
+    def _layout(self) -> None:
+        available = max(self.width() - 2 * MONTAGE_EDGE, 1)
+        widths = montage_widths(
+            [media.duration for media, _frames in self._clips], available
+        )
+        self._rects = []
+        x = float(MONTAGE_EDGE)
+        for width in widths:
+            self._rects.append(QRectF(x, 2, width, MONTAGE_HEIGHT - MONTAGE_CAPTION_H - 4))
+            x += width
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
-        track = QRectF(8, 4, self.width() - 16, 18)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(COLORS["timeline_track"]))
-        painter.drawRoundedRect(track, 4, 4)
+        if not self._clips:
+            painter.setPen(QPen(QColor(COLORS["ink_muted"]), 1))
+            painter.drawText(
+                QRectF(0, 0, self.width(), self.height()),
+                Qt.AlignmentFlag.AlignCenter,
+                "Añade clips para ver el montaje",
+            )
+            return
 
-        total = sum(max(m.duration, 0.01) for m in self._items) or 1.0
-        palette = [COLORS["clip_a"], COLORS["clip_b"], COLORS["clip_c"], COLORS["accent"]]
-        x = track.x()
-        for i, item in enumerate(self._items):
-            w = track.width() * (max(item.duration, 0.01) / total)
-            rect = QRectF(x + 1, track.y() + 1, max(w - 2, 2), track.height() - 2)
-            painter.setBrush(QColor(palette[i % len(palette)]))
-            painter.drawRoundedRect(rect, 3, 3)
-            x += w
+        for (media, frames), rect in zip(self._clips, self._rects, strict=True):
+            self._paint_segment(painter, media, frames, rect)
 
         painter.setPen(QPen(QColor(COLORS["ink_muted"]), 1))
         painter.drawText(
-            QRectF(8, 24, self.width() - 16, 14),
+            QRectF(MONTAGE_EDGE, self.height() - MONTAGE_CAPTION_H, self.width() - 2 * MONTAGE_EDGE,
+                   MONTAGE_CAPTION_H),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             self._caption(),
         )
 
+    def _paint_segment(
+        self,
+        painter: QPainter,
+        media: MediaInfo,
+        frames: EdgeFrames | None,
+        rect: QRectF,
+    ) -> None:
+        hot = media.path == self._highlight
+        painter.setPen(QPen(QColor(COLORS["accent"] if hot else COLORS["line"]), 2 if hot else 1))
+        painter.setBrush(QColor(EMPTY_SURFACE if hot else COLORS["timeline_track"]))
+        painter.drawRoundedRect(rect, 3, 3)
+
+        inner = rect.adjusted(2, 2, -2, -2)
+        if inner.width() < 4 or inner.height() < 4:
+            return
+        if frames is None:
+            return
+
+        # Primer y último fotograma lado a lado, encogidos hasta que quepan.
+        size = min(MONTAGE_FRAME_MAX, inner.height(), max(inner.width() / 2 - 1, 1))
+        if size < 6:
+            return
+        first = frame_pixmap(frames, last=False).scaled(
+            int(size), int(size),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        last = frame_pixmap(frames, last=True).scaled(
+            int(size), int(size),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        y = inner.y() + (inner.height() - size) / 2
+        painter.drawPixmap(int(inner.x()), int(y), first)
+        painter.drawPixmap(int(inner.right() - size), int(y), last)
+
     def _caption(self) -> str:
-        if not self._items:
-            return "Añade clips para ver la línea de tiempo"
-        total = sum(m.duration for m in self._items)
+        if not self._clips:
+            return ""
+        total = sum(media.duration for media, _frames in self._clips)
         mins, secs = divmod(int(total), 60)
         hours, mins = divmod(mins, 60)
         stamp = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
-        return f"{len(self._items)} clips · duración estimada {stamp}"
+        suffix = ""
+        if self._highlight is not None:
+            name = next((m.label for m, _f in self._clips if m.path == self._highlight), "")
+            suffix = f" · resaltado {name}" if name else ""
+        return f"{len(self._clips)} clips · duración estimada {stamp}{suffix}"

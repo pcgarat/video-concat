@@ -20,6 +20,20 @@ Si no lo son, se normaliza y recodifica con esta cascada:
 > siguen en CPU tras un `hwdownload` mínimo. Aun así, decode y scale (lo caro
 > en resolución alta) ocurren en la GPU.
 
+## Filas por fotograma
+
+En vez de un listado plano, los clips se agrupan en **filas**:
+
+- Una fila reúne los clips cuyo **primer y último fotograma** coinciden o casi
+  coinciden (umbral ajustable, `0.93` por defecto). Son variantes del mismo plano.
+- El orden inicial encadena por continuidad: `último(A) ≈ primero(B)`. Si dos
+  clips acaban igual, el primero va justo antes del otro.
+- Arrastra las filas para reordenar; ese orden manda sobre el automático.
+- Cada fila tiene **un solo clip activo** (clic en la fila; botón de variante si
+  agrupa varios). Se muestra miniatura del primer fotograma y se reproduce en la
+  propia fila con el play.
+- La concatenación respeta el orden de las filas y usa el clip activo de cada una.
+
 ## Requisitos
 
 - Python 3.11+
@@ -77,6 +91,6 @@ make run MEDIA_DIR=/ruta/a/tus/videos
 
 ```
 src/video_concat/
-  core/     probe, compatibilidad, concat, GPU
-  ui/       PySide6 (mesa de montaje)
+  core/     probe, frames (fotogramas), grouping (filas), compatibilidad, concat, GPU
+  ui/       PySide6 (mesa de montaje: filas arrastrables + reproductor inline)
 ```

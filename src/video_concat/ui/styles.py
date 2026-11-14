@@ -124,6 +124,59 @@ QPushButton#Danger {{
     border-color: {COLORS["danger"]};
     color: {COLORS["danger"]};
 }}
+QPushButton#Variant {{
+    background-color: {COLORS["surface_raised"]};
+    border: 1px solid {COLORS["line"]};
+    border-radius: 12px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    color: {COLORS["ink_muted"]};
+}}
+QPushButton#Variant:hover {{
+    color: {COLORS["ink"]};
+    border-color: {COLORS["ink_muted"]};
+}}
+QFrame#ClipRow {{
+    background-color: {COLORS["surface_raised"]};
+    border: 1px solid {COLORS["line"]};
+    border-left: 4px solid {COLORS["line"]};
+    border-radius: 6px;
+}}
+QFrame#ClipRow:hover {{
+    border-color: {COLORS["ink_muted"]};
+}}
+QFrame#ClipRow[selected="true"] {{
+    border-left: 4px solid {COLORS["accent"]};
+    background-color: #FFFDFA;
+}}
+QFrame#ClipRow[dropTarget="true"] {{
+    border-top: 2px solid {COLORS["accent"]};
+}}
+QLabel#RowHandle {{
+    color: {COLORS["line"]};
+    font-size: 16px;
+}}
+QLabel#RowTitle {{
+    font-weight: 600;
+    font-size: 13px;
+    color: {COLORS["ink"]};
+}}
+QLabel#RowDetail {{
+    color: {COLORS["ink_muted"]};
+    font-size: 11px;
+}}
+QLabel#RowTags {{
+    font-size: 11px;
+    font-weight: 600;
+}}
+QScrollArea {{
+    background-color: transparent;
+    border: none;
+}}
+QScrollArea > QWidget > QWidget {{
+    background-color: transparent;
+}}
 QLineEdit {{
     background-color: {COLORS["surface_raised"]};
     border: 1px solid {COLORS["line"]};

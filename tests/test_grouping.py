@@ -374,3 +374,24 @@ class TestUnknownDuration:
         assert similarity(edges.first, edges.last) < 0.9, (
             "el último fotograma no puede ser una copia del primero"
         )
+
+
+def test_distance_matches_rmse_definition():
+    """`math.dist` no puede cambiar la semántica: debe ser el RMSE normalizado."""
+    import math
+
+    from video_concat.core.frames import distance
+
+    a = FrameSignature(rgb=(0.0, 0.5, 1.0))
+    b = FrameSignature(rgb=(0.5, 0.5, 0.0))
+    expected = math.sqrt(((0.5) ** 2 + 0 + (1.0) ** 2) / 3)
+    assert distance(a, b) == pytest.approx(expected)
+
+
+def test_distance_is_clamped_to_one():
+    """Firmas opuestas saturan en 1.0 (la similitud nunca es negativa)."""
+    from video_concat.core.frames import distance
+
+    a = FrameSignature(rgb=(0.0,))
+    b = FrameSignature(rgb=(1.0,))
+    assert distance(a, b) == pytest.approx(1.0)

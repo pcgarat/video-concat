@@ -75,6 +75,9 @@ concatenación, con su **primer y último fotograma** dibujados dentro.
 - Al pasar el ratón por una tarjeta concreta se resalta **esa** tarjeta, aunque no
   sea la activa de su fila; al salir de la tarjeta se vuelve a resaltar la activa,
   que es la que se concatenará.
+- El montaje es **clicable**: pulsar un tramo selecciona la fila que aporta ese
+  clip y lo marca con borde de tinta y fondo encendido (distinto del ámbar
+  transitorio del hover). Clicar el margen no hace nada.
 
 ## Requisitos
 

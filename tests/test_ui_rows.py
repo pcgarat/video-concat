@@ -389,6 +389,80 @@ def test_hover_does_not_track_tiles_outside_the_row(app):
     assert seen == [], "sin estar sobre la fila no se emite nada"
 
 
+def _click(widget, point):
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QMouseEvent
+
+    event = QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress,
+        point,
+        widget.mapToGlobal(point.toPoint()),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    widget.mousePressEvent(event)
+
+
+def test_clicking_a_montage_segment_selects_its_row(populated, app):
+    """Pulsar un tramo del montaje selecciona la fila que aporta ese clip."""
+    window = populated
+    app.processEvents()
+    target = window.montage.clip_paths()[2]
+    rect = window.montage.rect_for(target)
+    assert rect is not None
+    _click(window.montage, rect.center())
+    app.processEvents()
+
+    selected = [i for i, row in enumerate(window.rows.rows()) if row.is_selected()]
+    assert selected == [2]
+    assert window.rows.rows()[2].active.media.path == target
+    assert window.montage.selected == target
+
+
+def test_clicking_the_margin_changes_nothing(populated, app):
+    from PySide6.QtCore import QPointF
+
+    window = populated
+    app.processEvents()
+    before = window.montage.selected
+    _click(window.montage, QPointF(1, 1))
+    app.processEvents()
+    assert window.montage.selected == before
+    assert sum(1 for row in window.rows.rows() if row.is_selected()) == 1
+
+
+def test_path_at_maps_points_to_segments(populated, app):
+    from PySide6.QtCore import QPointF
+
+    window = populated
+    app.processEvents()
+    first = window.montage.clip_paths()[0]
+    rect = window.montage.rect_for(first)
+    assert window.montage.path_at(rect.center()) == first
+    assert window.montage.path_at(QPointF(0, 0)) is None
+
+
+def test_montage_selection_follows_row_selection(populated, app):
+    """Seleccionar en la lista también marca el tramo correspondiente."""
+    window = populated
+    window._on_row_selected(1)
+    app.processEvents()
+    assert window.montage.selected == window.rows.rows()[1].active.media.path
+
+
+def test_selected_segment_is_cleared_when_rows_disappear(populated, app):
+    window = populated
+    window._on_row_selected(2)
+    app.processEvents()
+    dropped = window.rows.rows()[2].active.media.path
+    window._on_row_selected(2)
+    window._remove_selection()
+    app.processEvents()
+    assert dropped not in window.montage.clip_paths()
+    assert window.montage.selected != dropped
+
+
 def test_detach_button_emits_the_clip_it_sits_on(app):
     """El botón ↓ de una tarjeta pide separar ese clip concreto, no la fila."""
     from video_concat.ui.widgets import ClipGroupRow

@@ -37,6 +37,7 @@ from video_concat.ui.widgets import (
     ClipGroupRow,
     GroupRowList,
     MontageStrip,
+    ToggleSwitch,
 )
 
 VIDEO_FILTER = "Vídeos MP4 (*.mp4 *.MP4)"
@@ -178,6 +179,8 @@ class MainWindow(QMainWindow):
         self._groups: list[ClipGroup] = []
         self._threshold = DEFAULT_THRESHOLD
         self._order: list[Path] = []
+        # Orden automático por fotogramas; apagado por defecto, manda el orden manual.
+        self._auto_sort = False
         # Clips sacados de su fila a mano: el agrupado automático no los reabsorbe.
         self._detached: set[Path] = set()
         self._follow_anchor: Path | None = None
@@ -252,6 +255,18 @@ class MainWindow(QMainWindow):
         self.btn_show_all.setVisible(False)
         self.btn_show_all.clicked.connect(self._clear_follow_filter)
         head.addWidget(self.btn_show_all)
+        self.sort_label = QLabel("Orden automático")
+        self.sort_label.setStyleSheet(f"color: {COLORS['ink_muted']}; font-size: 11px;")
+        head.addWidget(self.sort_label)
+        self.sort_switch = ToggleSwitch("Orden automático")
+        self.sort_switch.setChecked(self._auto_sort)
+        self.sort_switch.setToolTip(
+            "Apagado: el orden es el tuyo; los clips nuevos se añaden al final.\n"
+            "Encendido: al añadir clips se encadenan por fotogramas y el orden "
+            "automático manda."
+        )
+        self.sort_switch.toggled.connect(self._on_sort_toggled)
+        head.addWidget(self.sort_switch, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.threshold_box = QComboBox()
         for label, value in THRESHOLDS:
             self.threshold_box.addItem(label, value)
@@ -536,14 +551,15 @@ class MainWindow(QMainWindow):
         """
         Recalcula el agrupado y repinta las filas.
 
-        El orden manual del usuario vive en `self._order` y manda siempre que
-        exista: un flag por llamada no servía, porque la ingesta de un clip
+        Con el orden automático encendido manda el encadenado por fotogramas;
+        apagado, manda el orden manual de `self._order` y los clips nuevos se
+        añaden al final. Un flag por llamada no servía: la ingesta de un clip
         nuevo reconstruía con los valores por defecto y revertía el arrastre.
         """
         items = list(self._media.values())
         by_path = {m.path: m for m in items}
         ordered: list[MediaInfo] = []
-        if self._order:
+        if self._order and not self._auto_sort:
             ordered = [by_path[p] for p in self._order if p in by_path]
             placed = {m.path for m in ordered}
             ordered += [m for m in items if m.path not in placed]
@@ -556,7 +572,7 @@ class MainWindow(QMainWindow):
             items,
             self._frames,
             self._threshold,
-            preserve_input_order=bool(self._order),
+            preserve_input_order=not self._auto_sort,
             detached=self._detached,
         )
         self._render_rows(previous)
@@ -728,11 +744,13 @@ class MainWindow(QMainWindow):
         order.insert(position, path)
         self._detached.add(path)
         self._order = order
+        changed = self._surrender_auto_sort()
 
         label = self._media[path].label if path in self._media else path.name
         log.info("Clip separado a fila propia: %s", path)
         self._rebuild_groups()
-        self.status_label.setText(f"{label} movido a una fila propia")
+        prefix = "Orden manual activado · " if changed else ""
+        self.status_label.setText(f"{prefix}{label} movido a una fila propia")
 
     def _reattach_clip(self, path: Path) -> None:
         """
@@ -781,11 +799,14 @@ class MainWindow(QMainWindow):
         Con sólo la referencia, arrastrar una fila con variantes borraba del
         modelo los miembros no activos y el clip desaparecía sin aviso.
         """
+        changed = self._surrender_auto_sort()
         ordered: list[Path] = []
         for row in self.rows.rows():
             ordered.extend(member.media.path for member in row.group.members)
         self._order = ordered
         self._rebuild_groups()
+        if changed:
+            self.status_label.setText("Orden manual activado al arrastrar una fila")
 
     def _selected_media(self) -> list[MediaInfo]:
         """Un clip por fila visible (el activo), en el orden actual de las filas."""
@@ -802,6 +823,48 @@ class MainWindow(QMainWindow):
             f"{groups} fila(s) · {len(selected)} clip(s) seleccionado(s)\n"
             f"Duración de salida ≈ {format_duration(total)}"
         )
+
+    @Slot(bool)
+    def _on_sort_toggled(self, checked: bool) -> None:
+        """
+        Enciende o apaga el encadenado automático por fotogramas.
+
+        Al apagarlo se congela el orden que se está viendo, para que el
+        siguiente recálculo no lo reordene a espaldas del usuario; al
+        encenderlo se descarta ese orden manual y manda la continuidad.
+        """
+        self._auto_sort = checked
+        self._sync_sort_switch()
+        if checked:
+            self._order = []
+            log.info("Orden automático encendido: se re-encadena por fotogramas")
+            message = "Orden automático: encadenado por fotogramas"
+        else:
+            self._order = self._current_order()
+            log.info("Orden automático apagado: manda el orden manual")
+            message = "Orden manual: coloca las filas a tu gusto"
+        self._rebuild_groups()
+        self.status_label.setText(message)
+
+    def _sync_sort_switch(self) -> None:
+        """Refleja `_auto_sort` en el interruptor sin reemitir `toggled`."""
+        self.sort_switch.blockSignals(True)
+        self.sort_switch.setChecked(self._auto_sort)
+        self.sort_switch.blockSignals(False)
+
+    def _surrender_auto_sort(self) -> bool:
+        """
+        Un gesto manual de montaje apaga el automático sin reordenar nada.
+
+        Devolver si estaba encendido permite al llamante explicarlo en su
+        propio mensaje de estado, en vez de pisarse dos avisos.
+        """
+        if not self._auto_sort:
+            return False
+        self._auto_sort = False
+        self._sync_sort_switch()
+        log.info("Orden automático apagado por un gesto manual")
+        return True
 
     def _on_threshold_changed(self, index: int) -> None:
         self._threshold = float(self.threshold_box.itemData(index))
@@ -910,6 +973,7 @@ class MainWindow(QMainWindow):
         has_rows = bool(self.rows.rows())
         for b in (self.btn_add, self.btn_remove, self.btn_clear, self.threshold_box):
             b.setEnabled(not self._busy)
+        self.sort_switch.setEnabled(not self._busy)
         self.btn_remove.setEnabled(not self._busy and has_rows)
         self.btn_clear.setEnabled(not self._busy and bool(self._media))
 

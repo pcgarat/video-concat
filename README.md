@@ -35,12 +35,19 @@ En vez de un listado plano, los clips se agrupan en **filas**:
   `B~C` superan el umbral pero `A~C` no, no se fusionan los tres. Con un solo
   clip activo por fila, una fusión así dejaría un clip que nunca podría
   concatenarse.
-- El orden inicial encadena por continuidad: `último(A) ≈ primero(B)`. Las filas
-  cuyo último fotograma coincide van seguidas, y esa regla actúa como desempate:
-  no se cuela entre un par que encaja exactamente.
-- Las filas sin firmas (clip ilegible) no arrancan la cadena: se colocan al final.
-- Arrastra las filas por el asa `⠿` para reordenar; ese orden **persiste** y manda
-  sobre el automático, incluso al añadir clips nuevos.
+- Con el orden automático **encendido**, el orden encadena por continuidad:
+  `último(A) ≈ primero(B)`. Las filas cuyo último fotograma coincide van seguidas,
+  y esa regla actúa como desempate: no se cuela entre un par que encaja exactamente.
+- Las filas sin firmas (clip ilegible) no arrancan la cadena: se colocan al final, y
+  conservan esa última posición también con el automático encendido.
+- El interruptor **«Orden automático»** de la cabecera decide quién manda en el orden:
+  - **Apagado** (por defecto): manda el orden que fijes tú. Los clips entran al
+    final en el orden en que los añades y los recálculos no reordenan nada.
+  - **Encendido**: cada recálculo —añadir clips, cambiar el umbral— re-encadena
+    por fotogramas; al encenderlo se descarta el orden manual y se re-encadena.
+- Arrastra las filas por el asa `⠿` para reordenar; arrastrar (o sacar un clip con
+  el botón ↓) **apaga el automático** si estaba encendido, porque es una decisión
+  manual de montaje.
 - Clic en un clip lo marca como **activo** de su fila; solo ese se concatena.
 - Cada tarjeta lleva un botón **↓** que la saca de su fila y la deja sola en la
   fila inmediatamente inferior, para montarla como plano propio sin perder la

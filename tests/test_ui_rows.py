@@ -99,9 +99,28 @@ def test_exactly_one_selected_row(populated):
     assert len(window._selected_media()) == len(window.rows.rows())
 
 
-def test_order_chains_by_continuity(populated):
-    """Cada clip empieza donde acaba el anterior, así que el orden es a -> b -> c."""
+def test_order_chains_by_continuity(window, app, clips_factory):
+    """Encendido el automático, el orden de filas sale por continuidad, no por ingesta."""
+    window._on_sort_toggled(True)
+    assert window._auto_sort is True
+
+    # Ingesta desordenada: c, a, b. Cada uno empieza donde acaba el anterior.
+    paths = [
+        clips_factory("c.mp4", first_color="blue", last_color="yellow"),
+        clips_factory("a.mp4", first_color="red", last_color="lime"),
+        clips_factory("b.mp4", first_color="lime", last_color="blue"),
+    ]
+    window._ingest_paths(paths)
+    assert _wait(app, lambda: not window._busy and len(window.rows.rows()) == 3)
+
+    names = [r.group.reference.media.path.name for r in window.rows.rows()]
+    assert names == ["a.mp4", "b.mp4", "c.mp4"]
+
+
+def test_order_keeps_ingestion_order_when_sort_is_off(populated):
+    """Apagado por defecto: se respeta el orden en que se añadieron los clips."""
     window = populated
+    assert window._auto_sort is False
     names = [r.group.reference.media.path.name for r in window.rows.rows()]
     assert names == ["a.mp4", "b.mp4", "c.mp4"]
 
@@ -144,6 +163,132 @@ def test_manual_order_survives_ingesting_another_clip(populated, app, clips_fact
     after = [r.group.reference.media.path.name for r in window.rows.rows()]
     assert after[:3] == intended, "la ingesta no puede revertir el orden manual"
     assert after[3] == "d.mp4"
+
+
+class TestAutoSortSwitch:
+    """El interruptor «orden automático» decide quién manda: fotogramas u orden manual."""
+
+    def test_auto_sort_is_off_by_default(self, populated):
+        assert populated._auto_sort is False
+        assert not populated.sort_switch.isChecked()
+
+    def test_auto_sort_chains_new_clips_by_continuity(self, window, app, clips_factory):
+        """Encendido: reordena por fotogramas y coloca el clip nuevo donde toca."""
+        window._on_sort_toggled(True)
+        # Ingesta desordenada: c, a, b.
+        paths = [
+            clips_factory("c.mp4", first_color="blue", last_color="yellow"),
+            clips_factory("a.mp4", first_color="red", last_color="lime"),
+            clips_factory("b.mp4", first_color="lime", last_color="blue"),
+        ]
+        window._ingest_paths(paths)
+        assert _wait(app, lambda: not window._busy and len(window.rows.rows()) == 3)
+        assert [r.active.media.path.name for r in window.rows.rows()] == [
+            "a.mp4",
+            "b.mp4",
+            "c.mp4",
+        ]
+        # Magenta → rojo: encaja justo antes de a.mp4 (que arranca en rojo).
+        extra = clips_factory("z.mp4", first_color="magenta", last_color="red")
+        window._ingest_paths([extra])
+        assert _wait(app, lambda: not window._busy)
+        assert [r.active.media.path.name for r in window.rows.rows()] == [
+            "z.mp4",
+            "a.mp4",
+            "b.mp4",
+            "c.mp4",
+        ]
+
+    def test_auto_sort_off_appends_new_clips_and_keeps_manual_order(
+        self, populated, app, clips_factory
+    ):
+        """Apagado: el orden manual manda y los clips nuevos entran al final."""
+        window = populated
+        window.rows.reorder(2, 0)
+        intended = [r.group.reference.media.path.name for r in window.rows.rows()]
+        assert intended == ["c.mp4", "a.mp4", "b.mp4"]
+        assert window._auto_sort is False, "arrastrar apaga el automático"
+
+        # Continúa a c.mp4, pero con el automático apagado no puede colarse delante.
+        extra = clips_factory("z.mp4", first_color="yellow", last_color="magenta")
+        window._ingest_paths([extra])
+        assert _wait(app, lambda: not window._busy)
+
+        after = [r.group.reference.media.path.name for r in window.rows.rows()]
+        assert after[:3] == intended
+        assert after[3] == "z.mp4"
+
+    def test_turning_sort_on_again_discards_manual_order(self, populated):
+        window = populated
+        window.rows.reorder(2, 0)
+        assert window._auto_sort is False
+
+        window._on_sort_toggled(True)
+
+        assert window._auto_sort is True
+        assert window.sort_switch.isChecked()
+        assert window._order == [], "encender el automático descarta el orden manual"
+        assert [r.active.media.path.name for r in window.rows.rows()] == [
+            "a.mp4",
+            "b.mp4",
+            "c.mp4",
+        ]
+
+    def test_turning_sort_off_freezes_the_visible_order(self, populated):
+        window = populated
+        window._on_sort_toggled(True)
+        window._on_sort_toggled(False)
+
+        assert window._auto_sort is False
+        assert [m.path.name for m in window._selected_media()] == ["a.mp4", "b.mp4", "c.mp4"]
+        assert window._order, "el orden visible se congela para no perderse"
+
+    def test_manual_order_survives_a_rebuild_with_sort_off(self, populated):
+        """Apagado, un recálculo (umbral) no puede reordenar las filas."""
+        window = populated
+        window.rows.reorder(2, 0)
+        intended = [r.group.reference.media.path.name for r in window.rows.rows()]
+
+        window._on_threshold_changed(2)
+
+        assert [r.group.reference.media.path.name for r in window.rows.rows()] == intended
+
+    def test_threshold_reorders_when_sort_is_on(self, populated):
+        window = populated
+        window._on_sort_toggled(True)
+        assert window._auto_sort is True
+        window._on_threshold_changed(2)
+        assert [r.active.media.path.name for r in window.rows.rows()] == [
+            "a.mp4",
+            "b.mp4",
+            "c.mp4",
+        ]
+
+    def test_detaching_a_clip_surrenders_auto_sort(self, variants):
+        window = variants
+        window._on_sort_toggled(True)
+        assert window._auto_sort is True
+
+        pair = next(row for row in window.rows.rows() if len(row.tiles) == 2)
+        window._detach_clip(pair.tiles[1].clip.media.path)
+
+        assert window._auto_sort is False
+        assert not window.sort_switch.isChecked()
+        assert "Orden manual" in window.status_label.text()
+
+    def test_clear_all_keeps_the_sort_setting(self, populated):
+        window = populated
+        window._on_sort_toggled(False)
+        window._clear_all()
+        assert window._auto_sort is False, "vaciar la lista no cambia la preferencia"
+        assert not window.sort_switch.isChecked()
+
+    def test_sort_switch_is_disabled_while_busy(self, populated):
+        window = populated
+        window._set_busy(True, "Analizando clips…")
+        assert not window.sort_switch.isEnabled()
+        window._set_busy(False, "Listo")
+        assert window.sort_switch.isEnabled()
 
 
 def test_removing_active_clip_keeps_the_others(populated):

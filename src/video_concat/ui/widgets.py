@@ -145,12 +145,14 @@ class FrameThumb(QWidget):
 class ToggleSwitch(QAbstractButton):
     """Interruptor compacto y checkable, sin texto; hereda `toggled(bool)`."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, accessible_name: str = "Interruptor", parent: QWidget | None = None
+    ) -> None:
         super().__init__(parent)
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(TOGGLE_WIDTH, TOGGLE_HEIGHT)
-        self.setAccessibleName("Mostrar siguientes")
+        self.setAccessibleName(accessible_name)
 
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(TOGGLE_WIDTH, TOGGLE_HEIGHT)
@@ -257,7 +259,7 @@ class ClipTile(QFrame):
             lambda checked: self.detach_requested.emit(self.clip.media.path, checked)
         )
         footer.addWidget(self.btn_detach, alignment=Qt.AlignmentFlag.AlignVCenter)
-        self.follow_switch = ToggleSwitch()
+        self.follow_switch = ToggleSwitch("Mostrar siguientes")
         self.follow_switch.setObjectName("FollowSwitch")
         self.follow_switch.setToolTip(
             "Mostrar solo los clips que empiezan como termina este"

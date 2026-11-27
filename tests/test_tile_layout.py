@@ -1,59 +1,52 @@
-"""Reparto de ancho de las tarjetas de una fila y del montaje (geometría pura, sin Qt)."""
+"""Geometría de las tarjetas del panel y del timeline (lógica pura, sin Qt)."""
 
 import pytest
 
 from video_concat.ui.layout_metrics import (
+    CARD_ZOOM_MAX,
+    CARD_ZOOM_MIN,
     MONTAGE_MIN_SEGMENT,
-    THUMB_MAX,
-    THUMB_MIN,
-    TILE_GAP,
+    card_metrics,
     montage_widths,
-    tile_metrics,
 )
 
 
-def _fits(count: int, available: int) -> bool:
-    width, _ = tile_metrics(count, available)
-    return width * count + TILE_GAP * (count - 1) <= available
+class TestCardMetrics:
+    """La tarjeta horizontal del panel crece con el zoom y cabe en el panel mínimo."""
 
+    def test_zoom_scales_the_card_and_its_thumbnails(self):
+        small_width, small_side = card_metrics(CARD_ZOOM_MIN)
+        big_width, big_side = card_metrics(CARD_ZOOM_MAX)
+        assert big_width > small_width
+        assert big_side > small_side
 
-def test_single_clip_is_capped():
-    """Una fila de un solo clip no estira su tarjeta sin límite."""
-    width, thumb = tile_metrics(1, 2000)
-    assert thumb == THUMB_MAX
-    assert width < 2000
+    def test_zoom_is_clamped_to_its_range(self):
+        assert card_metrics(0.1) == card_metrics(CARD_ZOOM_MIN)
+        assert card_metrics(20.0) == card_metrics(CARD_ZOOM_MAX)
 
+    def test_widest_card_still_fits_the_minimum_panel(self):
+        # 380 px de panel - márgenes - asa - bordes de fila.
+        widest, _ = card_metrics(CARD_ZOOM_MAX)
+        assert widest <= 310, "con el panel al mínimo la tarjeta no puede recortarse"
 
-def test_small_groups_fit_on_one_line():
-    for count in (1, 2, 3, 4, 5):
-        assert _fits(count, 1000), f"{count} clips deberían caber en 1000 px"
-    for count in (1, 2, 3):
-        assert _fits(count, 769), f"{count} clips deberían caber en 769 px"
+    def test_text_column_keeps_a_readable_width_at_every_zoom(self):
+        from video_concat.ui.layout_metrics import (
+            CARD_COLUMN_GAP,
+            CARD_PADDING,
+            CARD_TEXT_WIDTH,
+            CARD_THUMB_GAP,
+        )
 
-
-def test_thumbnail_shrinks_as_the_group_grows():
-    assert tile_metrics(2, 769)[1] > tile_metrics(5, 769)[1]
-    assert tile_metrics(5, 769)[1] >= tile_metrics(8, 769)[1]
-
-
-def test_thumbnail_never_below_minimum():
-    _, thumb = tile_metrics(40, 300)
-    assert thumb == THUMB_MIN
-
-
-def test_oversized_group_keeps_a_readable_width():
-    """Si el grupo no cabe, cada tarjeta mantiene su ancho mínimo (y habrá scroll)."""
-    width, thumb = tile_metrics(12, 760)
-    assert thumb == THUMB_MIN
-    assert width >= THUMB_MIN * 2
-    assert not _fits(12, 760)
-
-
-@pytest.mark.parametrize("count", [0, -1])
-def test_degenerate_counts(count: int):
-    width, thumb = tile_metrics(count, 760)
-    assert width > 0
-    assert thumb > 0
+        for zoom in (CARD_ZOOM_MIN, 1.0, CARD_ZOOM_MAX):
+            width, side = card_metrics(zoom)
+            text = (
+                width
+                - 2 * side
+                - CARD_THUMB_GAP
+                - CARD_COLUMN_GAP
+                - 2 * CARD_PADDING
+            )
+            assert text == CARD_TEXT_WIDTH
 
 
 class TestMontageWidths:

@@ -24,6 +24,7 @@ def main() -> int:
     from PySide6.QtWidgets import QApplication
 
     from video_concat.ui.main_window import MainWindow
+    from video_concat.ui.styles import apply_theme
 
     log = get_logger("main")
     log.info("Arrancando Video Concat")
@@ -31,6 +32,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Video Concat")
     app.setOrganizationName("tools")
+    apply_theme(app)
     window = MainWindow()
     window.show()
     log.info("Ventana visible (platform=%s)", app.platformName())

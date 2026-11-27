@@ -1,18 +1,42 @@
-"""Widgets de la mesa de montaje: miniatura de fotogramas, fila de grupo y lista."""
+"""Widgets de la sala de montaje: tarjetas de clip, filas y timeline."""
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QDrag, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import (
+    QEvent,
+    QMimeData,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QDrag,
+    QFont,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygonF,
+)
 from PySide6.QtWidgets import (
     QAbstractButton,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QPushButton,
-    QScrollArea,
+    QLayout,
+    QLayoutItem,
+    QMenu,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -21,32 +45,41 @@ from PySide6.QtWidgets import (
 from video_concat.core.frames import EdgeFrames
 from video_concat.core.grouping import ClipGroup, GroupedClip
 from video_concat.core.probe import MediaInfo
-from video_concat.ui.formatting import format_duration, format_size
+from video_concat.ui.formatting import format_duration, format_size, format_timecode
 from video_concat.ui.layout_metrics import (
+    CARD_BASE_THUMB,
+    CARD_COLUMN_GAP,
+    CARD_PADDING,
+    CARD_THUMB_GAP,
     MONTAGE_CAPTION_H,
     MONTAGE_EDGE,
-    MONTAGE_FRAME_MAX,
     MONTAGE_HEIGHT,
-    THUMB_MAX,
-    TILE_CAP,
-    TILE_GAP,
-    TILE_HEAD_SPACING,
-    TILE_PADDING,
-    TILE_PLAY_SIZE,
+    MONTAGE_PLAYHEAD_W,
+    card_font_sizes,
+    card_metrics,
+    clamp_zoom,
     montage_widths,
-    tile_metrics,
 )
 from video_concat.ui.styles import COLORS
+from video_concat.ui.timeline import TimelineMember, TimelineSlot
 
 ROW_MIME = "application/x-video-concat-row"
-EMPTY_SURFACE = "#EDF2F5"
-# Hueco reservado bajo las tarjetas para la barra de scroll horizontal.
-SCROLLBAR_RESERVE = 18
+TIMELINE_MIME = "application/x-video-concat-timeline"
+THUMB_FILL = "#080D11"
+# Hueco que ocupa el asa y los márgenes de una fila antes de las tarjetas.
+ROW_SIDE_SPACE = 46
 # Interruptor «mostrar siguientes» del pie de la tarjeta.
 TOGGLE_WIDTH = 28
 TOGGLE_HEIGHT = 15
-# Botón «sacar a fila nueva» del pie de la tarjeta.
-TILE_DETACH_SIZE = 22
+TILE_ACTION_SIZE = 22
+TILE_REMOVE_SIZE = 18
+# Píxeles que hay que mover el ratón sobre un tramo para arrastrarlo.
+DRAG_THRESHOLD = 6
+# Margen antes de cerrar la bandeja de variantes al salir del timeline.
+VARIANT_HIDE_MS = 180
+VARIANT_CHIP_W = 104
+VARIANT_THUMB_H = 56
+VARIANT_CHIP_H = VARIANT_THUMB_H + 24
 
 
 class ElidedLabel(QLabel):
@@ -54,17 +87,25 @@ class ElidedLabel(QLabel):
 
     def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._full = text
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self._apply()
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.setText(text)
 
     def setText(self, text: str) -> None:  # noqa: N802
         self._full = text
         self.setToolTip(text)
         self._apply()
 
+    def text(self) -> str:  # noqa: N802
+        """Devuelve el texto completo, no el recortado que se pinta."""
+        return self._full
+
     def full_text(self) -> str:
         return self._full
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        """El recorte con «…» permite cualquier ancho: no se impone el texto entero."""
+        return QSize(24, super().minimumSizeHint().height())
 
     def resizeEvent(self, event: QEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -88,13 +129,45 @@ def frame_pixmap(frames: EdgeFrames | None, last: bool = False) -> QPixmap:
     return QPixmap.fromImage(image.copy())
 
 
+def cover_pixmap(frames: EdgeFrames | None, width: int, height: int) -> QPixmap | None:
+    """
+    Primer fotograma escalado «a sangre» para un recuadro dado.
+
+    `KeepAspectRatioByExpanding` deja una imagen que cubre el recuadro; se
+    recorta el centro para no deformar el fotograma. Cachear este pixmap en el
+    layout evita reescalarlo en cada repintado del cursor.
+    """
+    if frames is None or width < 2 or height < 2:
+        return None
+    source = frame_pixmap(frames, last=False)
+    if source.isNull():
+        return None
+    scaled = source.scaled(
+        int(width),
+        int(height),
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    x = max(0, (scaled.width() - int(width)) // 2)
+    y = max(0, (scaled.height() - int(height)) // 2)
+    return scaled.copy(x, y, int(width), int(height))
+
+
 class FrameThumb(QWidget):
     """Miniatura de un fotograma extremo, etiquetada como primero o último."""
 
-    def __init__(self, caption: str, side: int = THUMB_MAX, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        caption: str,
+        short: str = "",
+        side: int = CARD_BASE_THUMB,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._caption = caption
+        self._short = short or caption[:1]
         self._pixmap = QPixmap()
+        self.setToolTip(caption.capitalize())
         self.set_fixed_side(side)
 
     def set_fixed_side(self, side: int) -> None:
@@ -113,12 +186,13 @@ class FrameThumb(QWidget):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
         painter.setPen(QPen(QColor(COLORS["line"]), 1))
-        painter.setBrush(QColor(EMPTY_SURFACE))
+        painter.setBrush(QColor(THUMB_FILL))
         painter.drawRoundedRect(rect, 4, 4)
 
         if self._pixmap.isNull():
             painter.setPen(QColor(COLORS["ink_muted"]))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "sin\nfotograma")
+            message = "sin\nfotograma" if self.width() >= 72 else "—"
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, message)
         else:
             scaled = self._pixmap.scaled(
                 int(rect.width()),
@@ -130,16 +204,17 @@ class FrameThumb(QWidget):
             y = rect.y() + (rect.height() - scaled.height()) / 2
             painter.drawPixmap(int(x), int(y), scaled)
 
-        if self.width() < 72:
-            return  # sin sitio para la etiqueta: el tooltip de la tarjeta ya lo explica
-        badge = QRectF(rect.x() + 3, rect.y() + 3, 42, 13)
+        badge_w, badge_h = (42.0, 13.0) if self.width() >= 64 else (16.0, 12.0)
+        badge = QRectF(rect.x() + 2, rect.y() + 2, badge_w, badge_h)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(COLORS["ink"]))
-        painter.setOpacity(0.78)
+        painter.setBrush(QColor(4, 8, 10, 190))
         painter.drawRoundedRect(badge, 3, 3)
-        painter.setOpacity(1.0)
-        painter.setPen(QColor(COLORS["surface_raised"]))
-        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, self._caption)
+        font = QFont(self.font())
+        font.setPixelSize(8 if self.width() < 64 else 9)
+        painter.setFont(font)
+        painter.setPen(QColor(COLORS["ink"]))
+        label = self._short if self.width() < 64 else self._caption
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
 
 
 class ToggleSwitch(QAbstractButton):
@@ -163,31 +238,273 @@ class ToggleSwitch(QAbstractButton):
         enabled = self.isEnabled()
         on = self.isChecked() and enabled
         track = QRectF(1, 1, self.width() - 2, self.height() - 2)
-        edge = COLORS["accent"] if on else COLORS["line"]
-        fill = COLORS["accent"] if on else COLORS["surface_raised"]
         if not enabled:
-            edge, fill = "#CBD5DC", "#EDF1F4"
+            edge, fill = COLORS["line_soft"], COLORS["surface"]
+        elif on:
+            edge, fill = COLORS["accent"], COLORS["accent"]
+        else:
+            edge, fill = COLORS["line"], COLORS["surface_raised"]
         painter.setPen(QPen(QColor(edge), 1))
         painter.setBrush(QColor(fill))
         painter.drawRoundedRect(track, track.height() / 2, track.height() / 2)
 
         knob = track.height() - 4
         x = track.right() - knob - 2 if self.isChecked() else track.left() + 2
-        knob_color = COLORS["surface_raised"] if on else COLORS["ink_muted"]
+        knob_color = "#14100C" if on else COLORS["ink_muted"]
         if not enabled:
-            knob_color = "#C3CDD4"
+            knob_color = "#4B5A63"
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(knob_color))
         painter.drawEllipse(QRectF(x, track.top() + 2, knob, knob))
 
 
+class IconButton(QAbstractButton):
+    """Botón de icono pintado a mano: sin ficheros ni fuentes de iconos."""
+
+    def __init__(
+        self,
+        icon: str,
+        size: int = 30,
+        tooltip: str = "",
+        parent: QWidget | None = None,
+        *,
+        checkable: bool = False,
+        filled: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self._icon = icon
+        self._hovered = False
+        self._filled = filled
+        self.setCheckable(checkable)
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(tooltip)
+        self.setAccessibleName(tooltip)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def set_icon(self, icon: str) -> None:
+        if icon == self._icon:
+            return
+        self._icon = icon
+        self.update()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        enabled = self.isEnabled()
+        checked = self.isChecked()
+        hovered = self._hovered and enabled
+        rect = QRectF(0, 0, self.width(), self.height())
+
+        if self._filled:
+            fill = COLORS["accent_hi"] if hovered and enabled else COLORS["accent"]
+            if not enabled:
+                fill = COLORS["line"]
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(fill))
+            painter.drawEllipse(rect.adjusted(1, 1, -1, -1))
+            color = QColor("#14100C" if enabled else COLORS["bg"])
+        else:
+            if checked:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(COLORS["accent_soft"]))
+                painter.drawRoundedRect(rect, 6, 6)
+            elif hovered:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(COLORS["surface_hi"]))
+                painter.drawRoundedRect(rect, 6, 6)
+            if not enabled:
+                color = QColor("#4A5962")
+            elif checked:
+                color = QColor(COLORS["accent"])
+            else:
+                color = QColor(COLORS["ink"] if hovered else COLORS["ink_muted"])
+
+        self._paint_glyph(painter, color)
+
+    def _paint_glyph(self, painter: QPainter, color: QColor) -> None:
+        painter.save()
+        pad = self.width() * 0.27
+        scale = (self.width() - 2 * pad) / 24.0
+        painter.translate(pad, pad)
+        painter.scale(scale, scale)
+        pen = QPen(color, 1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        icon = self._icon
+
+        if icon == "plus":
+            painter.drawLine(QPointF(6.5, 12), QPointF(17.5, 12))
+            painter.drawLine(QPointF(12, 6.5), QPointF(12, 17.5))
+        elif icon == "trash":
+            painter.drawLine(QPointF(5.5, 7.5), QPointF(18.5, 7.5))
+            painter.drawPath(_path([(9.5, 7.5), (9.5, 5), (14.5, 5), (14.5, 7.5)]))
+            painter.drawPath(
+                _path([(7.5, 7.5), (8.5, 19), (15.5, 19), (16.5, 7.5)])
+            )
+            painter.drawLine(QPointF(10.5, 10.5), QPointF(10.9, 16))
+            painter.drawLine(QPointF(13.5, 10.5), QPointF(13.1, 16))
+        elif icon == "panel":
+            painter.drawRoundedRect(QRectF(3.5, 5, 17, 14), 2.5, 2.5)
+            painter.drawLine(QPointF(14, 5), QPointF(14, 19))
+            for y in (8.5, 12, 15.5):
+                painter.drawLine(QPointF(15.8, y), QPointF(18.8, y))
+        elif icon == "folder":
+            painter.drawPath(
+                _path(
+                    [
+                        (3.5, 18),
+                        (3.5, 6.5),
+                        (9.2, 6.5),
+                        (11.4, 8.8),
+                        (20.5, 8.8),
+                        (20.5, 18),
+                        (3.5, 18),
+                    ]
+                )
+            )
+        elif icon == "play":
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPath(_path([(8, 5.5), (18.5, 12), (8, 18.5), (8, 5.5)]))
+        elif icon == "pause":
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(QRectF(7.5, 5.5, 3.4, 13), 1, 1)
+            painter.drawRoundedRect(QRectF(13.1, 5.5, 3.4, 13), 1, 1)
+        elif icon == "prev":
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(QRectF(6.5, 6, 2.4, 12), 1, 1)
+            painter.drawPath(_path([(18, 6), (10, 12), (18, 18), (18, 6)]))
+        elif icon == "next":
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(QRectF(15.1, 6, 2.4, 12), 1, 1)
+            painter.drawPath(_path([(6, 6), (14, 12), (6, 18), (6, 6)]))
+        elif icon == "close":
+            painter.drawLine(QPointF(6.5, 6.5), QPointF(17.5, 17.5))
+            painter.drawLine(QPointF(17.5, 6.5), QPointF(6.5, 17.5))
+        elif icon == "detach":
+            painter.drawLine(QPointF(12, 4), QPointF(12, 15))
+            painter.drawPath(_path([(8, 11), (12, 15.5), (16, 11)]))
+            painter.drawLine(QPointF(6, 19), QPointF(18, 19))
+        elif icon == "external":
+            painter.drawRoundedRect(QRectF(4.5, 9.5, 10, 10), 1.5, 1.5)
+            painter.drawPath(_path([(12.5, 11.5), (19.5, 4.5)]))
+            painter.drawPath(_path([(14.5, 4.5), (19.5, 4.5), (19.5, 9.5)]))
+        painter.restore()
+
+
+def _path(points: list[tuple[float, float]]) -> QPainterPath:
+    path = QPainterPath()
+    path.moveTo(*points[0])
+    for point in points[1:]:
+        path.lineTo(*point)
+    return path
+
+
+class FlowLayout(QLayout):
+    """Reparto en líneas que se reajusta al ancho: las tarjetas se envuelven."""
+
+    def __init__(
+        self, parent: QWidget | None = None, margin: int = 0, spacing: int = 6
+    ) -> None:
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    def addItem(self, item: QLayoutItem) -> None:  # noqa: N802
+        self._items.append(item)
+
+    def count(self) -> int:  # noqa: N802
+        return len(self._items)
+
+    def itemAt(self, index: int) -> QLayoutItem | None:  # noqa: N802
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int) -> QLayoutItem | None:  # noqa: N802
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):  # noqa: N802
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:  # noqa: N802
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:  # noqa: N802
+        size = QSize()
+        for item in self._items:
+            widget = item.widget()
+            if widget is not None and widget.isHidden():
+                continue
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        effective = rect.adjusted(
+            margins.left(), margins.top(), -margins.right(), -margins.bottom()
+        )
+        x, y = effective.x(), effective.y()
+        line_height = 0
+        gap = self.spacing()
+        for item in self._items:
+            widget = item.widget()
+            if widget is not None and widget.isHidden():
+                continue
+            hint = item.sizeHint()
+            next_x = x + hint.width() + gap
+            if next_x - gap > effective.right() + 1 and line_height > 0:
+                x = effective.x()
+                y += line_height + gap
+                next_x = x + hint.width() + gap
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + margins.bottom()
+
+
 class ClipTile(QFrame):
-    """Un clip dentro de la fila: primer y último fotograma, nombre y play."""
+    """Un clip del panel: extremos a la izquierda, ficha y acciones a la derecha."""
 
     activated = Signal(object)
-    play_requested = Signal(object)
+    preview_requested = Signal(object)
+    open_requested = Signal(object)
     detach_requested = Signal(object, bool)
     follow_toggled = Signal(object, bool)
+    remove_requested = Signal(object)
     hovered = Signal(object)
     unhovered = Signal()
 
@@ -196,101 +513,118 @@ class ClipTile(QFrame):
         self.setObjectName("ClipTile")
         self.clip = clip
         self._active = active
-        self._width = TILE_CAP
-        self._thumb_side = THUMB_MAX
+        self._zoom = 1.0
+        self._thumb_side = 0
         self._detach_available = False
-        self.setFixedWidth(self._width)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Maximum)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(TILE_PADDING, 6, TILE_PADDING, 6)
-        layout.setSpacing(3)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(CARD_PADDING, CARD_PADDING, CARD_PADDING, CARD_PADDING)
+        row.setSpacing(CARD_COLUMN_GAP)
 
-        head = QHBoxLayout()
-        head.setSpacing(TILE_HEAD_SPACING)
-        self.thumb_first = FrameThumb("primero")
-        self.thumb_last = FrameThumb("último")
+        thumbs = QWidget()
+        head = QHBoxLayout(thumbs)
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(CARD_THUMB_GAP)
+        self.thumb_first = FrameThumb("primero", "1º")
+        self.thumb_last = FrameThumb("último", "2º")
+        self.arrow = QLabel("›")
+        self.arrow.setStyleSheet(f"color: {COLORS['ink_muted']}; font-size: 13px;")
         head.addWidget(self.thumb_first)
+        head.addWidget(self.arrow, alignment=Qt.AlignmentFlag.AlignCenter)
         head.addWidget(self.thumb_last)
-        head.addStretch(1)
-        self.btn_play = QPushButton("▶")
-        self.btn_play.setObjectName("TilePlay")
-        self.btn_play.setFixedSize(TILE_PLAY_SIZE, TILE_PLAY_SIZE)
-        self.btn_play.setToolTip("Reproducir en el reproductor del sistema")
-        self.btn_play.clicked.connect(lambda: self.play_requested.emit(self.clip.media))
-        head.addWidget(self.btn_play, alignment=Qt.AlignmentFlag.AlignTop)
-        layout.addLayout(head)
+        row.addWidget(thumbs, alignment=Qt.AlignmentFlag.AlignTop)
 
         media = clip.media
+        column = QVBoxLayout()
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(2)
+
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(4)
         self.name = ElidedLabel(media.label)
         self.name.setObjectName("TileName")
-        self.name.setToolTip(f"{media.path}")
-        layout.addWidget(self.name)
+        self.name.setToolTip(str(media.path))
+        title_row.addWidget(self.name, 1)
+        self.btn_remove = IconButton("close", TILE_REMOVE_SIZE, "Quitar este clip de la lista")
+        self.btn_remove.clicked.connect(self._request_remove)
+        title_row.addWidget(self.btn_remove, alignment=Qt.AlignmentFlag.AlignTop)
+        column.addLayout(title_row)
 
         self.detail = ElidedLabel(
             f"{media.resolution} · {media.fps_label} fps · {format_duration(media.duration)}"
         )
         self.detail.setObjectName("TileDetail")
-        self.detail.setToolTip(self.detail.full_text())
-        layout.addWidget(self.detail)
-
-        self.status = ElidedLabel()
-        self.status.setObjectName("TileStatus")
-        if clip.problem:
-            self.status.setText(clip.problem)
-            self.status.setStyleSheet(f"color: {COLORS['warn']};")
-            self.status.setToolTip(clip.problem)
-        else:
-            self.status.setText(format_size(media.size_bytes))
-            self.status.setStyleSheet(f"color: {COLORS['ink_muted']};")
+        column.addWidget(self.detail)
 
         footer = QHBoxLayout()
+        footer.setContentsMargins(0, 0, 0, 0)
         footer.setSpacing(4)
-        footer.addWidget(self.status, stretch=1)
-        self.btn_detach = QPushButton("↓")
-        self.btn_detach.setObjectName("TileDetach")
-        self.btn_detach.setCheckable(True)
-        self.btn_detach.setFixedSize(TILE_DETACH_SIZE, TILE_DETACH_SIZE)
-        self.btn_detach.setToolTip(
-            "Sacar este clip a una fila nueva justo debajo (vuelve a pulsar para devolverlo)"
+        self.status = ElidedLabel()
+        self.status.setObjectName("TileStatus")
+        footer.addWidget(self.status, 1)
+
+        self.btn_detach = IconButton(
+            "detach",
+            TILE_ACTION_SIZE,
+            "Sacar este clip a una fila nueva justo debajo (vuelve a pulsar para devolverlo)",
+            checkable=True,
         )
         self.btn_detach.toggled.connect(
             lambda checked: self.detach_requested.emit(self.clip.media.path, checked)
         )
-        footer.addWidget(self.btn_detach, alignment=Qt.AlignmentFlag.AlignVCenter)
+        footer.addWidget(self.btn_detach)
+
         self.follow_switch = ToggleSwitch("Mostrar siguientes")
         self.follow_switch.setObjectName("FollowSwitch")
-        self.follow_switch.setToolTip(
-            "Mostrar solo los clips que empiezan como termina este"
-        )
+        self.follow_switch.setToolTip("Mostrar solo los clips que empiezan como termina este")
         self.follow_switch.toggled.connect(
             lambda checked: self.follow_toggled.emit(self.clip.media.path, checked)
         )
-        footer.addWidget(self.follow_switch, alignment=Qt.AlignmentFlag.AlignVCenter)
-        layout.addLayout(footer)
+        footer.addWidget(self.follow_switch)
 
-        layout.addStretch(1)
+        self.btn_play = IconButton("play", TILE_ACTION_SIZE, "Previsualizar este clip")
+        self.btn_play.clicked.connect(
+            lambda: self.preview_requested.emit(self.clip.media)
+        )
+        footer.addWidget(self.btn_play)
+        column.addLayout(footer)
+        column.addStretch(1)
+        row.addLayout(column, 1)
+
+        self.apply_zoom(1.0)
         self.set_frames(clip.frames)
         self.set_active(active)
+        self._refresh_status()
 
-    def set_tile_metrics(self, width: int, thumb_side: int) -> None:
-        """Ajusta el ancho de la tarjeta y el lado de sus dos miniaturas."""
-        if width == self._width and thumb_side == self._thumb_side:
-            return
-        self._width = width
-        self._thumb_side = thumb_side
-        self.thumb_first.set_fixed_side(thumb_side)
-        self.thumb_last.set_fixed_side(thumb_side)
-        self.setFixedWidth(width)
-        self.updateGeometry()
-
+    # --- estado ---
     @property
     def tile_width(self) -> int:
-        return self._width
+        return self.width()
 
     def height_hint(self) -> int:
         return self.sizeHint().height()
+
+    def apply_zoom(self, zoom: float) -> None:
+        """Escala miniaturas y tipografía con el deslizador del panel."""
+        self._zoom = clamp_zoom(zoom)
+        width, side = card_metrics(self._zoom)
+        self.setFixedWidth(width)
+        if side != self._thumb_side:
+            self._thumb_side = side
+            self.thumb_first.set_fixed_side(side)
+            self.thumb_last.set_fixed_side(side)
+        title_px, detail_px, status_px = card_font_sizes(self._zoom)
+        self.name.setStyleSheet(f"font-size: {title_px:.1f}px;")
+        self.detail.setStyleSheet(f"font-size: {detail_px:.1f}px;")
+        compact = self._zoom < 0.9
+        self.detail.setVisible(not compact)
+        self.status.setVisible(not compact)
+        self.arrow.setVisible(side >= 40)
+        self._refresh_status()
+        self.updateGeometry()
 
     def set_frames(self, frames: EdgeFrames | None) -> None:
         self.thumb_first.set_pixmap(frame_pixmap(frames, last=False))
@@ -336,6 +670,21 @@ class ClipTile(QFrame):
                 "Sin fotogramas analizados: no se puede comparar con los demás clips"
             )
 
+    def _refresh_status(self) -> None:
+        if self.clip.problem:
+            self.status.setText(self.clip.problem)
+            color = COLORS["warn"]
+        else:
+            self.status.setText(format_size(self.clip.media.size_bytes))
+            color = COLORS["ink_muted"]
+        _, detail_px, status_px = card_font_sizes(self._zoom)
+        self.status.setStyleSheet(f"font-size: {status_px:.1f}px; color: {color};")
+        self.status.setToolTip(self.status.full_text())
+
+    def _request_remove(self) -> None:
+        self.remove_requested.emit(self.clip.media)
+
+    # --- eventos ---
     def enterEvent(self, event) -> None:  # noqa: N802
         self.hovered.emit(self)
         super().enterEvent(event)
@@ -351,6 +700,24 @@ class ClipTile(QFrame):
             return
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.open_requested.emit(self.clip.media)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        menu = QMenu(self)
+        open_action = menu.addAction("Abrir en el reproductor del sistema")
+        menu.addSeparator()
+        remove_action = menu.addAction("Quitar de la lista")
+        chosen = menu.exec(event.globalPos())
+        if chosen is open_action:
+            self.open_requested.emit(self.clip.media)
+        elif chosen is remove_action:
+            self._request_remove()
+
 
 class DragHandle(QLabel):
     """Asa de arrastre de la fila: inicia el reordenado sin pisar los clics del clip."""
@@ -362,6 +729,7 @@ class DragHandle(QLabel):
         self.setObjectName("RowHandle")
         self.setFixedWidth(16)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
         self._origin: QPoint | None = None
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -384,10 +752,12 @@ class DragHandle(QLabel):
 
 
 class ClipGroupRow(QFrame):
-    """Una fila = un grupo; todos sus clips van en la misma línea."""
+    """Una fila = un grupo; sus tarjetas se envuelven en líneas según el ancho."""
 
     selected = Signal(int)
     play_requested = Signal(object)
+    preview_requested = Signal(object)
+    remove_requested = Signal(object)
     detach_requested = Signal(object, bool)
     follow_toggled = Signal(object, bool)
     hover_changed = Signal(object)
@@ -401,13 +771,14 @@ class ClipGroupRow(QFrame):
         self._selected = False
         self._hovered = False
         self._tiles: list[ClipTile] = []
-        self._metrics: tuple[int, int] | None = None
         self._relayouting = False
+        self._layout_key: tuple[int, int, int] | None = None
+        self._zoom = 1.0
         # Sin esto el hover se pierde al entrar en una tarjeta hija.
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 6, 12, 6)
+        layout.setContentsMargins(10, 8, 10, 10)
         layout.setSpacing(10)
 
         self.handle = DragHandle()
@@ -415,54 +786,46 @@ class ClipGroupRow(QFrame):
         layout.addWidget(self.handle, alignment=Qt.AlignmentFlag.AlignTop)
 
         column = QVBoxLayout()
-        column.setSpacing(4)
-        column.setContentsMargins(0, 2, 0, 0)
+        column.setSpacing(6)
+        column.setContentsMargins(0, 0, 0, 0)
 
         head = QHBoxLayout()
         head.setSpacing(8)
-        self.title = QLabel()
+        self.title = ElidedLabel()
         self.title.setObjectName("RowTitle")
         self.tags = QLabel()
         self.tags.setObjectName("RowTags")
-        head.addWidget(self.title)
-        head.addWidget(self.tags)
-        head.addStretch(1)
+        head.addWidget(self.title, 1)
+        head.addWidget(self.tags, 0)
         column.addLayout(head)
 
         self.strip = QWidget()
-        self._strip_layout = QHBoxLayout(self.strip)
-        self._strip_layout.setContentsMargins(0, 0, 0, 0)
-        self._strip_layout.setSpacing(TILE_GAP)
-        self._strip_layout.addStretch(1)
-
-        self.scroller = QScrollArea()
-        self.scroller.setObjectName("TileScroller")
-        self.scroller.setWidget(self.strip)
-        self.scroller.setWidgetResizable(True)
-        self.scroller.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroller.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.scroller.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.scroller.viewport().installEventFilter(self)
-        column.addWidget(self.scroller)
-
-        layout.addLayout(column, stretch=1)
+        self.flow = FlowLayout(self.strip, margin=0, spacing=8)
+        column.addWidget(self.strip)
+        layout.addLayout(column, 1)
 
         for member in group.members:
             tile = ClipTile(member, active=False)
             tile.activated.connect(self._on_tile_activated)
-            tile.play_requested.connect(self.play_requested)
+            tile.preview_requested.connect(self.preview_requested)
+            tile.open_requested.connect(self.play_requested)
+            tile.remove_requested.connect(self.remove_requested)
             tile.detach_requested.connect(self.detach_requested)
             tile.follow_toggled.connect(self.follow_toggled)
             tile.hovered.connect(self._on_tile_hovered)
             tile.unhovered.connect(self._on_tile_unhovered)
             tile.set_follow_available()
             tile.set_detach_available(len(group.members) > 1)
-            self._strip_layout.insertWidget(self._strip_layout.count() - 1, tile)
+            self.flow.addWidget(tile)
             self._tiles.append(tile)
 
         self._refresh()
-        self.relayout_tiles()
+        self.relayout_tiles(force=True)
+        # Segunda pasada diferida para cuando el alto real de la tarjeta cambia.
+        self._reflow_timer = QTimer(self)
+        self._reflow_timer.setSingleShot(True)
+        self._reflow_timer.setInterval(0)
+        self._reflow_timer.timeout.connect(self._reflow_after_zoom)
 
     # --- estado ---
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -497,42 +860,52 @@ class ClipGroupRow(QFrame):
     def hovered(self) -> bool:
         return self._hovered
 
-    def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        """El viewport del scroller conoce su ancho definitivo tras el primer layout."""
-        if watched is self.scroller.viewport() and event.type() == QEvent.Type.Resize:
-            self.relayout_tiles()
-        return super().eventFilter(watched, event)
+    def set_zoom(self, zoom: float) -> None:
+        self._zoom = clamp_zoom(zoom)
+        for tile in self._tiles:
+            tile.apply_zoom(self._zoom)
+        self._layout_key = None
+        self.relayout_tiles(force=True)
+        # El alto de una tarjeta solo es fiable con su layout ya activado:
+        # una segunda pasada evita dejar hueco muerto al encoger el zoom.
+        self._reflow_timer.start()
+
+    def _reflow_after_zoom(self) -> None:
+        self._layout_key = None
+        self.relayout_tiles(force=True)
 
     def relayout_tiles(self, force: bool = False) -> None:
         """
-        Reparte el ancho del grupo entre sus clips para que quepan en una línea.
+        Reparte las tarjetas en líneas según el ancho disponible.
 
-        Las miniaturas se encogen hasta `THUMB_MIN`; si el grupo no cabe ni así,
-        se queda con el tamaño mínimo y el scroller permite desplazarse. Solo
-        cuentan las tarjetas visibles: el filtro «mostrar siguientes» libera su
-        hueco en vez de dejar agujeros.
+        A diferencia de la tira horizontal anterior, aquí no hay scroll propio:
+        las tarjetas se envuelven y la fila crece en vertical. El alto de la
+        banda se fija a mano (contando líneas) para no encadenar varios
+        `heightForWidth` dentro del scroll de la lista.
         """
-        if not self._tiles or self._relayouting:
+        if self._relayouting:
             return
         visible = self.visible_tiles
         if not visible:
+            self.strip.setFixedHeight(0)
             return
-        available = self.scroller.viewport().width()
-        if available <= 0:
-            available = self.width() - 70
-        metrics = tile_metrics(len(visible), max(available, 1))
-        if metrics == self._metrics and not force:
+        available = max(self.width() - ROW_SIDE_SPACE, 240)
+        gap = self.flow.spacing()
+        card_width = visible[0].width() or 240
+        per_line = max(1, int((available + gap) // (card_width + gap)))
+        lines = math.ceil(len(visible) / per_line)
+        card_height = max(tile.height_hint() for tile in visible)
+        key = (available, card_width, card_height)
+        if key == self._layout_key and not force:
             return
 
         self._relayouting = True
         try:
-            self._metrics = metrics
-            width, side = metrics
-            for tile in visible:
-                tile.set_tile_metrics(width, side)
-            self._sync_scroller_height()
+            self._layout_key = key
+            self.strip.setFixedHeight(lines * card_height + (lines - 1) * gap)
         finally:
             self._relayouting = False
+        self.updateGeometry()
 
     def set_index(self, index: int) -> None:
         self.index = index
@@ -587,6 +960,7 @@ class ClipGroupRow(QFrame):
             )
             if first_visible is not None:
                 self._active = first_visible
+        self._layout_key = None
         self.relayout_tiles(force=True)
         self._refresh()
 
@@ -603,19 +977,6 @@ class ClipGroupRow(QFrame):
             # El clip del montaje cambia sin salir de la fila.
             self.hover_changed.emit(self.active.media.path)
 
-    def _sync_scroller_height(self) -> None:
-        """
-        Alto del scroller = alto que pide una tarjeta + hueco para la barra.
-
-        Se usa `sizeHint` (no la altura real): las tarjetas no deben estirarse en
-        vertical, y leer su altura real realimentaría el cálculo del scroller.
-        """
-        visible = self.visible_tiles
-        if not visible:
-            return
-        content = max(tile.height_hint() for tile in visible)
-        self.scroller.setFixedHeight(content + SCROLLBAR_RESERVE)
-
     def _refresh(self) -> None:
         total = len(self.group.members)
         for i, tile in enumerate(self._tiles):
@@ -627,15 +988,19 @@ class ClipGroupRow(QFrame):
             active = self.active.media.label
             shown = f"{visible} de {total} variantes" if visible < total else f"{total} variantes"
             self.title.setText(f"{position} · {shown}, activa {active}")
-            self.tags.setText(self.group.origin)
-            self.tags.setStyleSheet(f"color: {COLORS['ok']};")
+            self._set_tags(self.group.origin, COLORS["ok"])
         else:
             self.title.setText(f"{position} · {self.active.media.label}")
-            self.tags.setText(self.group.origin)
             color = COLORS["warn"] if self.active.problem else COLORS["ink_muted"]
-            self.tags.setStyleSheet(f"color: {color};")
+            self._set_tags(self.group.origin, color)
 
         self.handle.setToolTip("Arrastra para reordenar la fila")
+
+    def _set_tags(self, text: str, color: str) -> None:
+        metrics = self.tags.fontMetrics()
+        self.tags.setText(metrics.elidedText(text, Qt.TextElideMode.ElideRight, 112))
+        self.tags.setToolTip(text)
+        self.tags.setStyleSheet(f"color: {color}; font-size: 10px;")
 
     # --- arrastre ---
     def start_drag(self, _origin: QPoint | None = None) -> None:
@@ -663,7 +1028,7 @@ class GroupRowList(QWidget):
         self._rows: list[ClipGroupRow] = []
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(6)
+        self._layout.setSpacing(8)
         self._layout.addStretch(1)
         self.setAcceptDrops(True)
         self._drag_row: ClipGroupRow | None = None
@@ -749,49 +1114,290 @@ class GroupRowList(QWidget):
             if geometry.isValid() and y < geometry.center().y():
                 return i
         return len(self._rows)
+
     def _row_at(self, index: int | None) -> ClipGroupRow | None:
         if index is None or not (0 <= index < len(self._rows)):
             return None
         return self._rows[index]
 
 
+class VariantChip(QAbstractButton):
+    """Una variante de la ranura del timeline: su primer fotograma y su nombre."""
+
+    def __init__(
+        self,
+        member: TimelineMember,
+        position: int,
+        current: bool,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._member = member
+        self._position = position
+        self._current = current
+        self._hovered = False
+        self.setFixedSize(VARIANT_CHIP_W, VARIANT_CHIP_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(
+            f"{member.media.label} · {format_duration(member.media.duration)}"
+        )
+        self.setAccessibleName(f"Sustituir por {member.media.label}")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._cover = cover_pixmap(
+            member.frames, VARIANT_CHIP_W - 2 * CARD_PADDING, VARIANT_THUMB_H
+        )
+
+    @property
+    def position(self) -> int:
+        return self._position
+
+    @property
+    def is_current(self) -> bool:
+        return self._current
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
+        if self._current:
+            edge, width = COLORS["accent"], 2
+        elif self._hovered:
+            edge, width = COLORS["accent_hi"], 2
+        else:
+            edge, width = COLORS["line"], 1
+        painter.setPen(QPen(QColor(edge), width))
+        painter.setBrush(
+            QColor(COLORS["surface_hi"] if self._hovered else COLORS["surface_raised"])
+        )
+        painter.drawRoundedRect(rect, 6, 6)
+
+        thumb = QRectF(
+            CARD_PADDING,
+            CARD_PADDING,
+            self.width() - 2 * CARD_PADDING,
+            VARIANT_THUMB_H,
+        )
+        if self._cover is not None and not self._cover.isNull():
+            painter.save()
+            path = QPainterPath()
+            path.addRoundedRect(thumb, 4, 4)
+            painter.setClipPath(path)
+            painter.drawPixmap(thumb.toRect(), self._cover)
+            painter.restore()
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLORS["timeline_track"]))
+            painter.drawRoundedRect(thumb, 4, 4)
+
+        label = QRectF(
+            CARD_PADDING,
+            thumb.bottom() + 2,
+            self.width() - 2 * CARD_PADDING,
+            self.height() - thumb.bottom() - 4,
+        )
+        font = QFont(self.font())
+        font.setPixelSize(10)
+        painter.setFont(font)
+        painter.setPen(
+            QPen(QColor(COLORS["accent_hi"] if self._current else COLORS["ink"]), 1)
+        )
+        name = self.fontMetrics().elidedText(
+            self._member.media.label, Qt.TextElideMode.ElideMiddle, int(label.width())
+        )
+        painter.drawText(
+            label,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            name,
+        )
+
+
+class VariantPopup(QWidget):
+    """
+    Bandeja flotante con las variantes de la ranura bajo el cursor.
+
+    Se dibuja como hija de la ventana y no como ventana aparte: así aparece por
+    encima del timeline y de la barra de salida sin depender de que el gestor de
+    ventanas respete la posición pedida (Wayland ignora mover ventanas de nivel
+    superior). Se cierra sola al salir el cursor del timeline y de la bandeja.
+    """
+
+    def __init__(self, strip: MontageStrip) -> None:
+        super().__init__(None)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAutoFillBackground(True)
+        self._strip = strip
+        self._slot = -1
+        self._chips: list[VariantChip] = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.card = QFrame()
+        self.card.setObjectName("Panel")
+        outer.addWidget(self.card)
+        inner = QVBoxLayout(self.card)
+        inner.setContentsMargins(10, 8, 10, 10)
+        inner.setSpacing(6)
+        self.title = QLabel()
+        self.title.setObjectName("SectionTitle")
+        inner.addWidget(self.title)
+        self._row_host = QWidget()
+        self._row = QHBoxLayout(self._row_host)
+        self._row.setContentsMargins(0, 0, 0, 0)
+        self._row.setSpacing(6)
+        inner.addWidget(self._row_host)
+
+    @property
+    def slot(self) -> int:
+        return self._slot
+
+    def chips(self) -> list[VariantChip]:
+        return list(self._chips)
+
+    def show_for(self, index: int, slot: TimelineSlot, anchor: QRect) -> None:
+        host = self._strip.window()
+        if self.parentWidget() is not host:
+            self.setParent(host)
+        if index == self._slot and not self.isHidden() and self._chips:
+            return
+        self._clear()
+        self._slot = index
+        self.title.setText(f"FILA {slot.row + 1} · ELIGE VARIANTE")
+        for position, member in enumerate(slot.members):
+            chip = VariantChip(member, position, position == slot.active)
+            chip.clicked.connect(lambda _checked=False, pos=position: self.choose(pos))
+            self._row.addWidget(chip)
+            self._chips.append(chip)
+        self.adjustSize()
+        self._place(anchor)
+        self.show()
+        self.raise_()
+
+    def choose(self, position: int) -> None:
+        if self._slot < 0:
+            return
+        self._strip.request_variant(self._slot, position)
+
+    def _place(self, anchor: QRect) -> None:
+        """Coloca la bandeja centrada sobre el tramo, dentro de la ventana."""
+        host = self.parentWidget()
+        if host is None:
+            return
+        size = self.sizeHint()
+        top_left = self._strip.mapTo(host, anchor.topLeft())
+        bounds = host.rect()
+        x = top_left.x() + anchor.width() // 2 - size.width() // 2
+        x = max(bounds.left() + 4, min(x, bounds.right() - size.width() - 4))
+        y = top_left.y() - size.height() - 10
+        if y < bounds.top() + 4:
+            y = top_left.y() + anchor.height() + 10
+        self.setGeometry(x, y, size.width(), size.height())
+
+    def _clear(self) -> None:
+        for chip in self._chips:
+            self._row.removeWidget(chip)
+            chip.hide()
+            # Sin `setParent(None)`: un chip huérfano sería una ventana de nivel superior.
+            chip.deleteLater()
+        self._chips.clear()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._strip.cancel_variant_hide()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._strip.schedule_variant_hide()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        self._slot = -1
+        super().hideEvent(event)
+
+
 class MontageStrip(QWidget):
     """
-    Montaje completo: un tramo por clip, con su primer y su último fotograma.
+    Timeline del montaje: un tramo por clip, con su primer fotograma a sangre.
 
-    El ancho de cada tramo es proporcional a la duración del clip. La fila de la
-    lista que se resalta ilumina aquí su tramo, para no perder de vista qué clip
-    del montaje se está tocando. Al pulsar un tramo se pide seleccionar su fila.
+    El ancho de cada tramo es proporcional a la duración del clip activo. El
+    cursor (playhead) recorre el montaje con la reproducción y se puede mover
+    pulsando un punto del tramo. Los tramos se arrastran para reordenar las
+    filas, y los que tienen variantes muestran una bandeja para cambiarlas
+    encima del propio timeline.
     """
 
-    segment_clicked = Signal(object)
+    segment_clicked = Signal(object, float)
+    segment_moved = Signal(int, int)
+    variant_chosen = Signal(int, int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._clips: list[tuple[MediaInfo, EdgeFrames | None]] = []
+        self._slots: list[TimelineSlot] = []
         self._rects: list[QRectF] = []
+        self._covers: list[QPixmap | None] = []
         self._highlight: Path | None = None
         self._selected: Path | None = None
+        self._position = 0.0
+        self._press: QPointF | None = None
+        self._drop_gap: int | None = None
+        self._hover_slot: int | None = None
         self.setFixedHeight(MONTAGE_HEIGHT)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+        self._popup = VariantPopup(self)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(VARIANT_HIDE_MS)
+        self._hide_timer.timeout.connect(self.hide_variants_if_outside)
 
-    def set_clips(self, clips: list[tuple[MediaInfo, EdgeFrames | None]]) -> None:
-        self._clips = list(clips)
-        known = {media.path for media, _frames in self._clips}
+    # --- datos ---
+    def set_slots(self, slots: list[TimelineSlot]) -> None:
+        self._slots = list(slots)
+        known = {slot.media.path for slot in self._slots}
         if self._highlight is not None and self._highlight not in known:
             self._highlight = None
         if self._selected is not None and self._selected not in known:
             self._selected = None
+        self._position = min(self._position, self._total_duration())
+        self._hover_slot = None
+        self.hide_variants()
         self._layout()
         self.update()
+
+    def set_clips(self, clips: list[tuple[MediaInfo, EdgeFrames | None]]) -> None:
+        """Atajo para un montaje sin variantes: un miembro por tramo."""
+        self.set_slots(
+            [
+                TimelineSlot(
+                    row=index,
+                    members=(TimelineMember(media, frames),),
+                )
+                for index, (media, frames) in enumerate(clips)
+            ]
+        )
+
+    def slots(self) -> list[TimelineSlot]:
+        return list(self._slots)
 
     def set_highlight(self, path: Path | None) -> None:
         """Ilumina el tramo del clip; `None` apaga el resaltado."""
         if path == self._highlight:
             return
         self._highlight = path
-        self.setToolTip(next((m.label for m, _f in self._clips if m.path == path), ""))
+        label = next(
+            (slot.media.label for slot in self._slots if slot.media.path == path), ""
+        )
+        self.setToolTip(label)
         self.update()
 
     def set_selected(self, path: Path | None) -> None:
@@ -801,6 +1407,23 @@ class MontageStrip(QWidget):
         self._selected = path
         self.update()
 
+    def set_position(self, seconds: float) -> None:
+        """Mueve el cursor del timeline (tiempo global del montaje)."""
+        seconds = max(0.0, float(seconds))
+        if abs(seconds - self._position) < 0.001:
+            return
+        self._position = seconds
+        self.update()
+
+    @property
+    def position(self) -> float:
+        return self._position
+
+    @property
+    def playhead_x(self) -> float | None:
+        """Coordenada x del cursor; `None` si no hay clips."""
+        return self._playhead_x()
+
     @property
     def highlighted(self) -> Path | None:
         return self._highlight
@@ -809,135 +1432,422 @@ class MontageStrip(QWidget):
     def selected(self) -> Path | None:
         return self._selected
 
+    @property
+    def popup(self) -> VariantPopup:
+        return self._popup
+
+    @property
+    def drop_gap(self) -> int | None:
+        return self._drop_gap
+
     def clip_paths(self) -> list[Path]:
-        return [media.path for media, _frames in self._clips]
+        return [slot.media.path for slot in self._slots]
 
     def rect_for(self, path: Path) -> QRectF | None:
         """Rectángulo de un clip; útil para pruebas y para depurar el reparto."""
-        for (media, _frames), rect in zip(self._clips, self._rects, strict=True):
-            if media.path == path:
+        for slot, rect in zip(self._slots, self._rects, strict=True):
+            if slot.media.path == path:
                 return QRectF(rect)
+        return None
+
+    def slot_at(self, point: QPointF) -> int | None:
+        """Índice del tramo que contiene el punto."""
+        for index, rect in enumerate(self._rects):
+            if rect.contains(point):
+                return index
         return None
 
     def path_at(self, point: QPointF) -> Path | None:
         """Clip cuyo tramo contiene el punto, o `None` si se pulsa fuera."""
-        for (media, _frames), rect in zip(self._clips, self._rects, strict=True):
-            if rect.contains(point):
-                return media.path
-        return None
+        index = self.slot_at(point)
+        return None if index is None else self._slots[index].media.path
 
+    def time_at(self, point: QPointF) -> tuple[Path, float] | None:
+        """Clip y segundo local dentro de él para un punto del timeline."""
+        index = self.slot_at(point)
+        if index is None:
+            return None
+        rect = self._rects[index]
+        slot = self._slots[index]
+        if rect.width() <= 0:
+            return None
+        fraction = (point.x() - rect.x()) / rect.width()
+        duration = slot.media.duration
+        local = max(0.0, min(duration, fraction * duration))
+        return slot.media.path, local
+
+    def insertion_gap(self, x: float) -> int:
+        """Hueco (0..n) donde caería un tramo soltado en `x`."""
+        for index, rect in enumerate(self._rects):
+            if x < rect.center().x():
+                return index
+        return len(self._rects)
+
+    # --- variantes ---
+    def request_variant(self, index: int, position: int) -> None:
+        """Pide cambiar el clip activo de la ranura `index`."""
+        if not (0 <= index < len(self._slots)):
+            return
+        slot = self._slots[index]
+        if not (0 <= position < len(slot.members)) or position == slot.active:
+            self.hide_variants()
+            return
+        self.variant_chosen.emit(index, position)
+        self.hide_variants()
+
+    def show_variants(self, index: int) -> None:
+        if not (0 <= index < len(self._slots)) or index >= len(self._rects):
+            return
+        slot = self._slots[index]
+        if not slot.has_variants:
+            self.hide_variants()
+            return
+        anchor = self._rects[index].toRect()
+        self._hide_timer.stop()
+        self._popup.show_for(index, slot, anchor)
+
+    def hide_variants(self) -> None:
+        self._hide_timer.stop()
+        if self._popup.isVisible():
+            self._popup.hide()
+
+    def schedule_variant_hide(self) -> None:
+        if self._popup.isVisible():
+            self._hide_timer.start()
+
+    def cancel_variant_hide(self) -> None:
+        self._hide_timer.stop()
+
+    def hide_variants_if_outside(self) -> None:
+        if not self._popup.isVisible():
+            return
+        if self._popup.rect().contains(self._popup.mapFromGlobal(QCursor.pos())):
+            return
+        self.hide_variants()
+
+    def _update_hover(self, index: int | None) -> None:
+        if index == self._hover_slot:
+            return
+        self._hover_slot = index
+        self.update()
+        if index is not None and self._slots[index].has_variants:
+            self.show_variants(index)
+            return
+        self.hide_variants()
+
+    # --- eventos de ratón ---
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        over = self.path_at(event.position()) is not None
+        index = self.slot_at(event.position())
         self.setCursor(
-            Qt.CursorShape.PointingHandCursor if over else Qt.CursorShape.ArrowCursor
+            Qt.CursorShape.PointingHandCursor
+            if index is not None
+            else Qt.CursorShape.ArrowCursor
         )
+        if self._press is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            if (event.position() - self._press).manhattanLength() >= DRAG_THRESHOLD:
+                source = self.slot_at(event.position())
+                self._press = None
+                if source is not None:
+                    self._start_drag(source)
+                return
+        self._update_hover(index)
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._press = None
+        super().mouseReleaseEvent(event)
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self.cancel_variant_hide()
+        super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._hover_slot = None
+        self.schedule_variant_hide()
         super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            path = self.path_at(event.position())
-            if path is not None:
-                self.segment_clicked.emit(path)
+            index = self.slot_at(event.position())
+            if index is not None:
+                self._press = event.position()
+                hit = self.time_at(event.position())
+                if hit is not None:
+                    self.segment_clicked.emit(hit[0], hit[1])
                 event.accept()
                 return
         super().mousePressEvent(event)
 
+    # --- arrastre para reordenar ---
+    def _start_drag(self, index: int) -> None:
+        if not (0 <= index < len(self._rects)):
+            return
+        mime = QMimeData()
+        mime.setData(TIMELINE_MIME, str(index).encode())
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        rect = self._rects[index].toRect()
+        if rect.isValid():
+            drag.setPixmap(self.grab(rect))
+        drag.exec(Qt.DropAction.MoveAction)
+        self._drop_gap = None
+        self.update()
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasFormat(TIMELINE_MIME):
+            self._drop_gap = self.insertion_gap(event.position().x())
+            self.update()
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if not event.mimeData().hasFormat(TIMELINE_MIME):
+            return
+        self._drop_gap = self.insertion_gap(event.position().x())
+        self.update()
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self._drop_gap = None
+        self.update()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        if not event.mimeData().hasFormat(TIMELINE_MIME):
+            return
+        raw = bytes(event.mimeData().data(TIMELINE_MIME)).decode()
+        try:
+            source = int(raw)
+        except ValueError:
+            return
+        gap = self.insertion_gap(event.position().x())
+        self._drop_gap = None
+        self.update()
+        event.acceptProposedAction()
+        self.segment_moved.emit(source, gap)
+
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        # La bandeja está anclada a un tramo: al cambiar el reparto se recoloca sola.
+        self.hide_variants()
         self._layout()
+
+    # --- geometría ---
+    def _total_duration(self) -> float:
+        return sum(max(slot.media.duration, 0.001) for slot in self._slots)
 
     def _layout(self) -> None:
         available = max(self.width() - 2 * MONTAGE_EDGE, 1)
-        widths = montage_widths(
-            [media.duration for media, _frames in self._clips], available
-        )
+        widths = montage_widths([slot.media.duration for slot in self._slots], available)
         self._rects = []
         x = float(MONTAGE_EDGE)
         for width in widths:
-            self._rects.append(QRectF(x, 2, width, MONTAGE_HEIGHT - MONTAGE_CAPTION_H - 4))
+            self._rects.append(QRectF(x, 2, width, MONTAGE_HEIGHT - MONTAGE_CAPTION_H - 6))
             x += width
+        self._rebuild_covers()
 
+    def _rebuild_covers(self) -> None:
+        """Escala el primer fotograma de cada tramo a su recuadro (a sangre)."""
+        self._covers = []
+        for slot, rect in zip(self._slots, self._rects, strict=True):
+            self._covers.append(
+                cover_pixmap(slot.frames, int(rect.width()), int(rect.height()))
+            )
+
+    def _gap_x(self, gap: int) -> float:
+        if not self._rects:
+            return float(MONTAGE_EDGE)
+        if gap <= 0:
+            return self._rects[0].left()
+        if gap >= len(self._rects):
+            return self._rects[-1].right()
+        return self._rects[gap].left()
+
+    def _playhead_x(self) -> float | None:
+        if not self._slots or not self._rects:
+            return None
+        remaining = self._position
+        last = len(self._slots) - 1
+        for index, (slot, rect) in enumerate(zip(self._slots, self._rects, strict=True)):
+            duration = max(slot.media.duration, 0.001)
+            if remaining <= duration or index == last:
+                fraction = max(0.0, min(remaining / duration, 1.0))
+                return rect.x() + fraction * rect.width()
+            remaining -= duration
+        return self._rects[-1].right()
+
+    # --- pintura ---
     def paintEvent(self, _event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
-        if not self._clips:
+        if not self._slots:
             painter.setPen(QPen(QColor(COLORS["ink_muted"]), 1))
             painter.drawText(
                 QRectF(0, 0, self.width(), self.height()),
                 Qt.AlignmentFlag.AlignCenter,
-                "Añade clips para ver el montaje",
+                "El timeline aparecerá aquí: añade clips para montar la secuencia",
             )
             return
 
-        for (media, frames), rect in zip(self._clips, self._rects, strict=True):
-            self._paint_segment(painter, media, frames, rect)
+        for index, rect in enumerate(self._rects):
+            self._paint_segment(painter, index, rect)
 
-        painter.setPen(QPen(QColor(COLORS["ink_muted"]), 1))
-        painter.drawText(
-            QRectF(MONTAGE_EDGE, self.height() - MONTAGE_CAPTION_H, self.width() - 2 * MONTAGE_EDGE,
-                   MONTAGE_CAPTION_H),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            self._caption(),
-        )
+        self._paint_played(painter)
+        self._paint_playhead(painter)
+        self._paint_drop_gap(painter)
+        self._paint_caption(painter)
 
-    def _paint_segment(
-        self,
-        painter: QPainter,
-        media: MediaInfo,
-        frames: EdgeFrames | None,
-        rect: QRectF,
-    ) -> None:
-        hot = media.path == self._highlight
-        chosen = media.path == self._selected
-        if chosen:
-            edge, fill, width = COLORS["ink"], "#FFFDFA", 2
-        elif hot:
-            edge, fill, width = COLORS["accent"], EMPTY_SURFACE, 2
+    def _paint_segment(self, painter: QPainter, index: int, rect: QRectF) -> None:
+        slot = self._slots[index]
+        hot = slot.media.path == self._highlight
+        chosen = slot.media.path == self._selected
+        hovered = index == self._hover_slot
+        has_variants = slot.has_variants
+
+        painter.save()
+        path = QPainterPath()
+        path.addRoundedRect(rect, 3, 3)
+        painter.setClipPath(path)
+        cover = self._covers[index] if index < len(self._covers) else None
+        if cover is not None and not cover.isNull():
+            painter.drawPixmap(rect.toRect(), cover)
         else:
-            edge, fill, width = COLORS["line"], COLORS["timeline_track"], 1
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLORS["timeline_track"]))
+            painter.drawRect(rect)
+        painter.restore()
+
+        if chosen:
+            edge, width = COLORS["accent_hi"], 2
+        elif hovered or hot or has_variants:
+            edge, width = COLORS["accent"], 2
+        else:
+            edge, width = COLORS["line"], 1
         painter.setPen(QPen(QColor(edge), width))
-        painter.setBrush(QColor(fill))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(rect, 3, 3)
 
-        inner = rect.adjusted(2, 2, -2, -2)
-        if inner.width() < 4 or inner.height() < 4:
-            return
-        if frames is None:
-            return
+        if chosen:
+            bar = QRectF(rect.left() + 3, rect.bottom() - 4, max(rect.width() - 6, 1), 2)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLORS["accent_hi"]))
+            painter.drawRoundedRect(bar, 1, 1)
 
-        # Primer y último fotograma lado a lado, encogidos hasta que quepan.
-        size = min(MONTAGE_FRAME_MAX, inner.height(), max(inner.width() / 2 - 1, 1))
-        if size < 6:
-            return
-        first = frame_pixmap(frames, last=False).scaled(
-            int(size), int(size),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        last = frame_pixmap(frames, last=True).scaled(
-            int(size), int(size),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        y = inner.y() + (inner.height() - size) / 2
-        painter.drawPixmap(int(inner.x()), int(y), first)
-        painter.drawPixmap(int(inner.right() - size), int(y), last)
+        if has_variants:
+            self._paint_variant_badge(painter, slot, rect)
 
-    def _caption(self) -> str:
-        if not self._clips:
-            return ""
-        total = sum(media.duration for media, _frames in self._clips)
-        mins, secs = divmod(int(total), 60)
-        hours, mins = divmod(mins, 60)
-        stamp = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
+    def _paint_variant_badge(
+        self, painter: QPainter, slot: TimelineSlot, rect: QRectF
+    ) -> None:
+        if rect.width() < 34 or rect.height() < 24:
+            return
+        badge = QRectF(rect.right() - 28, rect.top() + 4, 24, 14)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(6, 10, 12, 200))
+        painter.drawRoundedRect(badge, 3, 3)
+        font = QFont(self.font())
+        font.setPixelSize(9)
+        font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(font)
+        painter.setPen(QPen(QColor(COLORS["accent_hi"]), 1))
+        painter.drawText(
+            badge,
+            Qt.AlignmentFlag.AlignCenter,
+            f"▾{len(slot.members)}",
+        )
+
+    def _paint_played(self, painter: QPainter) -> None:
+        x = self._playhead_x()
+        if x is None or x <= 0:
+            return
+        painter.save()
+        painter.setClipRect(QRectF(0, 0, x, self.height()))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(242, 167, 104, 34))
+        for rect in self._rects:
+            painter.drawRoundedRect(rect, 3, 3)
+        painter.restore()
+
+    def _paint_playhead(self, painter: QPainter) -> None:
+        x = self._playhead_x()
+        if x is None:
+            return
+        top = 2.0
+        bottom = MONTAGE_HEIGHT - MONTAGE_CAPTION_H - 4
+        painter.setPen(
+            QPen(
+                QColor(COLORS["playhead"]),
+                MONTAGE_PLAYHEAD_W,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+            )
+        )
+        painter.drawLine(QPointF(x, top), QPointF(x, bottom))
+        handle = QPolygonF(
+            [
+                QPointF(x - 4.5, top),
+                QPointF(x + 4.5, top),
+                QPointF(x, top + 6.5),
+            ]
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(COLORS["playhead"]))
+        painter.drawPolygon(handle)
+
+    def _paint_drop_gap(self, painter: QPainter) -> None:
+        if self._drop_gap is None or not self._rects:
+            return
+        x = self._gap_x(self._drop_gap)
+        top = 2.0
+        bottom = MONTAGE_HEIGHT - MONTAGE_CAPTION_H - 4
+        painter.setPen(QPen(QColor(COLORS["accent_hi"]), 2))
+        painter.drawLine(QPointF(x, top), QPointF(x, bottom))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(COLORS["accent_hi"]))
+        painter.drawPolygon(
+            QPolygonF(
+                [QPointF(x - 4, top), QPointF(x + 4, top), QPointF(x, top + 6)]
+            )
+        )
+
+    def _paint_caption(self, painter: QPainter) -> None:
+        baseline = QRectF(
+            MONTAGE_EDGE,
+            self.height() - MONTAGE_CAPTION_H,
+            self.width() - 2 * MONTAGE_EDGE,
+            MONTAGE_CAPTION_H,
+        )
+        total = self._total_duration()
+        variants = sum(1 for slot in self._slots if slot.has_variants)
+        summary = f"{len(self._slots)} clips · {format_duration(total)}"
+        if variants:
+            summary += f" · {variants} con variantes"
+        painter.setPen(QPen(QColor(COLORS["ink_muted"]), 1))
+        painter.drawText(
+            baseline,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            summary,
+        )
         suffix = ""
         if self._highlight is not None:
-            name = next((m.label for m, _f in self._clips if m.path == self._highlight), "")
-            suffix = f" · resaltado {name}" if name else ""
-        return f"{len(self._clips)} clips · duración estimada {stamp}{suffix}"
+            name = next(
+                (slot.media.label for slot in self._slots if slot.media.path == self._highlight),
+                "",
+            )
+            if name:
+                short = name if len(name) <= 26 else name[:25] + "…"
+                suffix = f" · resaltado {short}"
+        mono = QFont(self.font())
+        mono.setFamilies(
+            ["IBM Plex Mono", "JetBrains Mono", "DejaVu Sans Mono", "Liberation Mono", "monospace"]
+        )
+        mono.setPixelSize(10)
+        painter.setFont(mono)
+        painter.setPen(QPen(QColor(COLORS["accent_hi"]), 1))
+        painter.drawText(
+            baseline,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            f"cursor {format_timecode(self._position)}{suffix}",
+        )

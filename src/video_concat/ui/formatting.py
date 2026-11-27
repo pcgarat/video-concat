@@ -12,6 +12,16 @@ def format_duration(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def format_timecode(seconds: float) -> str:
+    """Timecode de editor: siempre con dos dígitos de minutos y segundos."""
+    total = int(max(0.0, seconds))
+    m, s = divmod(total, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
 def format_size(n: int) -> str:
     units = ["B", "KB", "MB", "GB"]
     size = float(n)

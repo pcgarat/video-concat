@@ -1,41 +1,54 @@
-"""Geometría pura de la tira de clips de una fila (sin dependencias de Qt)."""
+"""Geometría pura de las tarjetas y del timeline (sin dependencias de Qt)."""
 
 from __future__ import annotations
 
-TILE_PADDING = 6
-TILE_PLAY_SIZE = 20
-TILE_HEAD_SPACING = 6
-TILE_GAP = 8
-THUMB_MIN = 52
-THUMB_MAX = 84
-# Lo que ocupa la cabecera de la tarjeta además de las dos miniaturas.
-THUMB_ROW_EXTRA = TILE_PLAY_SIZE + TILE_HEAD_SPACING + 2 * TILE_PADDING
-# Tope de ancho: evita tarjetas gigantes en grupos de uno o dos clips.
-TILE_CAP = THUMB_MAX * 2 + THUMB_ROW_EXTRA
+# Tarjeta horizontal del panel de clips: dos miniaturas a la izquierda y la
+# ficha a la derecha. El zoom del panel escala ambas cosas a la vez.
+CARD_ZOOM_MIN = 0.75
+CARD_ZOOM_MAX = 1.4
+CARD_PADDING = 8
+CARD_THUMB_GAP = 4
+CARD_COLUMN_GAP = 8
+CARD_TEXT_WIDTH = 150
+CARD_BASE_THUMB = 44
 
 
-def tile_metrics(count: int, available: int) -> tuple[int, int]:
+def clamp_zoom(zoom: float) -> float:
+    return max(CARD_ZOOM_MIN, min(float(zoom), CARD_ZOOM_MAX))
+
+
+def card_metrics(zoom: float) -> tuple[int, int]:
     """
-    Reparte `available` px entre `count` tarjetas en una sola línea.
+    `(ancho, lado_miniatura)` de una tarjeta horizontal para un zoom dado.
 
-    Devuelve `(ancho_tarjeta, lado_miniatura)`. La miniatura se encoge hasta
-    `THUMB_MIN` para que el grupo quepa; si ni así cabe, la tarjeta se queda en
-    su ancho mínimo y la fila permite desplazarse (nunca se comprime el texto).
+    El ancho crece con las miniaturas, no con el texto: la columna de ficha se
+    queda en un ancho legible y el nombre se recorta con «…» si no cabe.
     """
-    if count <= 0:
-        return TILE_CAP, THUMB_MAX
-    slot = (available - TILE_GAP * (count - 1)) / count
-    side = int((slot - THUMB_ROW_EXTRA) // 2)
-    side = max(THUMB_MIN, min(side, THUMB_MAX))
-    return side * 2 + THUMB_ROW_EXTRA, side
+    zoom = clamp_zoom(zoom)
+    side = int(round(CARD_BASE_THUMB * zoom))
+    width = (
+        side * 2
+        + CARD_THUMB_GAP
+        + CARD_COLUMN_GAP
+        + CARD_TEXT_WIDTH
+        + 2 * CARD_PADDING
+    )
+    return width, side
+
+
+def card_font_sizes(zoom: float) -> tuple[float, float, float]:
+    """Tamaños (nombre, detalle, estado) en px para el zoom del panel."""
+    zoom = clamp_zoom(zoom)
+    return (11.0 + 2.0 * zoom, 9.0 + 1.2 * zoom, 9.0 + 1.0 * zoom)
 
 
 # Montaje: cada clip ocupa un tramo proporcional a su duración.
 MONTAGE_EDGE = 8
-MONTAGE_CAPTION_H = 14
-MONTAGE_HEIGHT = 62
-MONTAGE_FRAME_MAX = 32
+MONTAGE_CAPTION_H = 16
+MONTAGE_HEIGHT = 104
+MONTAGE_FRAME_MAX = 40
 MONTAGE_MIN_SEGMENT = 14
+MONTAGE_PLAYHEAD_W = 2
 
 
 def montage_widths(
